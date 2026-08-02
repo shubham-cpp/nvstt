@@ -1,0 +1,22 @@
+[Unit]
+Description=nvstt local Wayland voice dictation daemon
+After=graphical-session.target pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/nvstt daemon
+Restart=on-failure
+RestartSec=2s
+Environment=RUST_LOG=nvstt=info
+
+# The daemon is a per-user service. Keep its files and socket private.
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/nvstt %h/.local/state/nvstt %h/.local/share/nvstt %t/nvstt
+
+[Install]
+WantedBy=default.target
