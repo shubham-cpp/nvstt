@@ -106,6 +106,20 @@ impl AudioSource {
             .map_err(|_| AppError::Unavailable("audio capture lock was poisoned".to_owned()))?;
         Ok(state.overflowed)
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_source(sample_rate: i32, samples: Vec<f32>) -> Self {
+        let total_samples = samples.len();
+        Self {
+            capture: Arc::new(Mutex::new(CaptureState {
+                sample_rate,
+                channels: 1,
+                samples: samples.into(),
+                total_samples,
+                overflowed: false,
+            })),
+        }
+    }
 }
 
 /// Default microphone recorder backed by the user's default CPAL input device.

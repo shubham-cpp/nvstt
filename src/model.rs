@@ -10,17 +10,6 @@ use serde::Serialize;
 
 use crate::{config::Config, paths::AppPaths};
 
-/// The files accepted by the sherpa-onnx Parakeet loader.
-///
-/// INT8 files are the supported release artifact. The unquantized names are
-/// accepted because the recognizer also supports them for local experiments.
-const MODEL_FILE_ALTERNATIVES: [(&str, [&str; 2]); 4] = [
-    ("encoder", ["encoder.int8.onnx", "encoder.onnx"]),
-    ("decoder", ["decoder.int8.onnx", "decoder.onnx"]),
-    ("joiner", ["joiner.int8.onnx", "joiner.onnx"]),
-    ("tokens", ["tokens.txt", "tokens.txt"]),
-];
-
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelFileStatus {
     pub name: String,
@@ -29,39 +18,58 @@ pub struct ModelFileStatus {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct SpeechGateStatus {
+    pub enabled: bool,
+    pub path: PathBuf,
+    pub ready: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ModelStatus {
     pub model: String,
+    pub streaming_profile: String,
     pub artifact: String,
     pub path: PathBuf,
     pub ready: bool,
     pub files: Vec<ModelFileStatus>,
+    pub speech_gate: SpeechGateStatus,
 }
 
 impl ModelStatus {
     pub fn inspect(config: &Config, paths: &AppPaths) -> Self {
         let path = paths.model_dir.join(config.artifact_name());
-        let files = MODEL_FILE_ALTERNATIVES
+        let files = config
+            .required_model_files()
             .iter()
-            .map(|(name, alternatives)| {
-                let selected = alternatives
+            .map(|file| {
+                let selected = file
+                    .alternatives
                     .iter()
                     .map(|file| path.join(file))
                     .find(|candidate| candidate.is_file())
-                    .unwrap_or_else(|| path.join(alternatives[0]));
+                    .unwrap_or_else(|| path.join(file.alternatives[0]));
                 ModelFileStatus {
-                    name: (*name).to_owned(),
+                    name: file.name.to_owned(),
                     present: selected.is_file(),
                     path: selected,
                 }
             })
             .collect::<Vec<_>>();
+        let vad_path = path.join("silero_vad.onnx");
+        let speech_gate = SpeechGateStatus {
+            enabled: config.speech_gate,
+            ready: !config.speech_gate || vad_path.is_file(),
+            path: vad_path,
+        };
 
         Self {
             model: config.model.clone(),
+            streaming_profile: config.streaming_profile.clone(),
             artifact: config.artifact_name().to_owned(),
             path,
-            ready: files.iter().all(|file| file.present),
+            ready: files.iter().all(|file| file.present) && speech_gate.ready,
             files,
+            speech_gate,
         }
     }
 
@@ -78,7 +86,10 @@ impl ModelStatus {
             return format!("model ready at {}", self.path.display());
         }
 
-        let missing = self.missing_files();
+        let mut missing = self.missing_files();
+        if !self.speech_gate.ready {
+            missing.push("silero VAD".to_owned());
+        }
         format!(
             "model is not installed at {}; missing {}",
             self.path.display(),
@@ -112,6 +123,7 @@ mod tests {
         let status = ModelStatus::inspect(&Config::default(), &paths(directory.path()));
         assert!(!status.ready);
         assert_eq!(status.missing_files().len(), 4);
+        assert!(!status.speech_gate.ready);
     }
 
     #[test]
@@ -128,9 +140,34 @@ mod tests {
         ] {
             std::fs::write(model_path.join(file), b"test").expect("model file");
         }
+        std::fs::write(model_path.join("silero_vad.onnx"), b"test").expect("VAD file");
 
         let status = ModelStatus::inspect(&Config::default(), &paths);
         assert!(status.ready);
         assert!(status.missing_files().is_empty());
+        assert!(status.speech_gate.ready);
+    }
+
+    #[test]
+    fn a_legacy_parakeet_model_is_ready_without_vad() {
+        let directory = tempdir().expect("temporary directory");
+        let paths = paths(directory.path());
+        let config = Config::for_model(crate::config::PARAKEET_UNIFIED_MODEL, "1120ms")
+            .expect("valid Parakeet config");
+        let model_path = paths.model_dir.join(config.artifact_name());
+        std::fs::create_dir_all(&model_path).expect("model directory");
+        for file in [
+            "encoder.int8.onnx",
+            "decoder.int8.onnx",
+            "joiner.int8.onnx",
+            "tokens.txt",
+        ] {
+            std::fs::write(model_path.join(file), b"test").expect("model file");
+        }
+
+        let status = ModelStatus::inspect(&config, &paths);
+        assert!(status.ready);
+        assert!(!status.speech_gate.enabled);
+        assert!(status.speech_gate.ready);
     }
 }

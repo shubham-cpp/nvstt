@@ -7,6 +7,7 @@ pub enum NotificationEvent {
     InitializationFailed(String),
     ListeningStarted,
     Finalizing,
+    NoSpeechDetected,
     Transcribed,
     Delivered(String),
     CopiedToClipboard,
@@ -26,6 +27,7 @@ impl NotificationEvent {
             Self::InitializationFailed(reason) => ("Initialization failed", reason.clone()),
             Self::ListeningStarted => ("Listening", "Dictation started".to_owned()),
             Self::Finalizing => ("Transcribing", "Finalizing dictation".to_owned()),
+            Self::NoSpeechDetected => ("No speech", "Nothing was sent".to_owned()),
             Self::Transcribed => ("Transcribed", "Transcript ready".to_owned()),
             Self::Delivered(backend) => {
                 ("Delivered", format!("Transcript delivered via {backend}"))

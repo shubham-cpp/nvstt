@@ -3,11 +3,13 @@ use nvstt::{
     app::run_daemon,
     config::Config,
     error::{AppError, Result},
+    evaluation::{EvaluationReport, evaluate_model},
     installer::{DownloadProgress, install_model},
     ipc::{IpcRequest, IpcResponse, send_request},
     model::ModelStatus,
     paths::default_paths,
 };
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "nvstt", version, about = "Local Linux voice dictation")]
@@ -46,14 +48,52 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum ModelCommand {
     /// Download and install the configured model.
-    Install,
+    Install {
+        /// Select a supported model without changing the user configuration.
+        #[arg(long)]
+        model: Option<String>,
+        /// Select a model streaming profile without changing the user configuration.
+        #[arg(long)]
+        streaming_profile: Option<String>,
+    },
     /// Show model files and readiness.
     Status {
         #[arg(long)]
         json: bool,
+        /// Select a supported model without changing the user configuration.
+        #[arg(long)]
+        model: Option<String>,
+        /// Select a model streaming profile without changing the user configuration.
+        #[arg(long)]
+        streaming_profile: Option<String>,
     },
     /// Print the expected model directory.
-    Path,
+    Path {
+        /// Select a supported model without changing the user configuration.
+        #[arg(long)]
+        model: Option<String>,
+        /// Select a model streaming profile without changing the user configuration.
+        #[arg(long)]
+        streaming_profile: Option<String>,
+    },
+    /// Evaluate an installed model against a private JSONL WAV manifest.
+    Evaluate {
+        /// Path to a JSONL manifest. Relative audio paths use its directory.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Select a supported model without changing the user configuration.
+        #[arg(long)]
+        model: Option<String>,
+        /// Select a model streaming profile without changing the user configuration.
+        #[arg(long)]
+        streaming_profile: Option<String>,
+        /// Override the selected configuration's speech gate for this evaluation only.
+        #[arg(long)]
+        speech_gate: Option<bool>,
+        /// Print the complete machine-readable report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -87,10 +127,13 @@ fn run_model_command(
     config: &Config,
     command: ModelCommand,
 ) -> Result<()> {
-    let status = ModelStatus::inspect(config, paths);
     match command {
-        ModelCommand::Install => {
-            let report = install_model(config, paths, |progress: DownloadProgress| {
+        ModelCommand::Install {
+            model,
+            streaming_profile,
+        } => {
+            let selected = config.with_model_overrides(model, streaming_profile)?;
+            let report = install_model(&selected, paths, |progress: DownloadProgress| {
                 if let Some(total) = progress.total_bytes {
                     eprintln!(
                         "downloading model: {:.1} / {:.1} MiB",
@@ -107,15 +150,27 @@ fn run_model_command(
             println!("{}", report.message());
             Ok(())
         }
-        ModelCommand::Path => {
+        ModelCommand::Path {
+            model,
+            streaming_profile,
+        } => {
+            let selected = config.with_model_overrides(model, streaming_profile)?;
+            let status = ModelStatus::inspect(&selected, paths);
             println!("{}", status.path.display());
             Ok(())
         }
-        ModelCommand::Status { json } => {
+        ModelCommand::Status {
+            json,
+            model,
+            streaming_profile,
+        } => {
+            let selected = config.with_model_overrides(model, streaming_profile)?;
+            let status = ModelStatus::inspect(&selected, paths);
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
                 println!("model: {}", status.model);
+                println!("streaming profile: {}", status.streaming_profile);
                 println!("artifact: {}", status.artifact);
                 println!("path: {}", status.path.display());
                 println!("ready: {}", status.ready);
@@ -127,6 +182,9 @@ fn run_model_command(
                         file.path.display()
                     );
                 }
+                println!("speech gate enabled: {}", status.speech_gate.enabled);
+                println!("speech gate path: {}", status.speech_gate.path.display());
+                println!("speech gate ready: {}", status.speech_gate.ready);
                 println!("message: {}", status.message());
             }
             if status.ready {
@@ -135,7 +193,65 @@ fn run_model_command(
                 Err(AppError::Unavailable(status.message()))
             }
         }
+        ModelCommand::Evaluate {
+            manifest,
+            model,
+            streaming_profile,
+            speech_gate,
+            json,
+        } => {
+            let mut selected = config.with_model_overrides(model, streaming_profile)?;
+            if let Some(speech_gate) = speech_gate {
+                selected.speech_gate = speech_gate;
+            }
+            let report = evaluate_model(&selected, paths, &manifest)?;
+            print_evaluation_report(&report, json)?;
+            Ok(())
+        }
     }
+}
+
+fn print_evaluation_report(report: &EvaluationReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    println!("model: {}", report.model);
+    println!("streaming profile: {}", report.streaming_profile);
+    println!("provider: {}", report.execution_provider);
+    println!("speech gate: {}", report.speech_gate_enabled);
+    println!(
+        "word errors: {} (S={} D={} I={}, WER={:.3})",
+        report.total_word_errors,
+        report.total_substitutions,
+        report.total_deletions,
+        report.total_insertions,
+        report.word_error_rate,
+    );
+    println!("silent/noise failures: {}", report.silent_clip_failures);
+    println!(
+        "finalization latency: p50={} ms p95={} ms",
+        report.p50_finalization_latency_ms, report.p95_finalization_latency_ms
+    );
+    for clip in &report.clips {
+        println!(
+            "{} [{}]: WER={:.3} S={} D={} I={} silent_failure={} backlog={} ms model_flush={} ms finalization={} ms",
+            clip.id,
+            clip.category,
+            clip.word_error_rate,
+            clip.substitutions,
+            clip.deletions,
+            clip.insertions,
+            clip.silent_clip_failure,
+            clip.pre_stop_backlog_ms,
+            clip.model_finalization_ms,
+            clip.finalization_latency_ms,
+        );
+        println!("  reference: {}", clip.reference);
+        println!("  hypothesis: {}", clip.hypothesis);
+    }
+    Ok(())
 }
 
 async fn run_request(

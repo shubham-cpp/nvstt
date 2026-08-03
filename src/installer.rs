@@ -1,8 +1,8 @@
 //! Explicit model download and installation.
 //!
 //! Installation is intentionally separate from daemon startup. The command
-//! downloads the pinned Parakeet archive into a private staging directory,
-//! validates its file set, and activates it only after extraction succeeds.
+//! downloads the pinned ASR archive and optional speech gate into a private
+//! staging directory. It activates both only after validation succeeds.
 
 use std::{
     env,
@@ -18,22 +18,13 @@ use bzip2::read::BzDecoder;
 use tar::Archive;
 
 use crate::{
-    config::Config,
+    config::{Config, RequiredModelFileSpec},
     error::{AppError, Result},
     model::ModelStatus,
     paths::AppPaths,
 };
 
-pub const MODEL_ARCHIVE_NAME: &str =
-    "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-560ms.tar.bz2";
-pub const MODEL_DOWNLOAD_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-560ms.tar.bz2";
-
-const REQUIRED_FILES: [&str; 4] = [
-    "encoder.int8.onnx",
-    "decoder.int8.onnx",
-    "joiner.int8.onnx",
-    "tokens.txt",
-];
+const VAD_FILE: &str = "silero_vad.onnx";
 const DOWNLOAD_BUFFER_SIZE: usize = 128 * 1024;
 const PROGRESS_STEP: u64 = 10 * 1024 * 1024;
 
@@ -89,7 +80,7 @@ where
     paths.create_user_dirs()?;
     let target = paths.model_dir.join(config.artifact_name());
     let staging = create_staging_dir(&paths.model_dir, config.artifact_name())?;
-    let result = install_into_staging(config.artifact_name(), &staging, &target, &mut progress);
+    let result = install_into_staging(config, &staging, &target, &mut progress);
     let cleanup_result = remove_path(&staging);
 
     match result {
@@ -110,7 +101,7 @@ where
 }
 
 fn install_into_staging<F>(
-    artifact: &str,
+    config: &Config,
     staging: &Path,
     target: &Path,
     progress: &mut F,
@@ -118,20 +109,40 @@ fn install_into_staging<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let archive_path = staging.join(MODEL_ARCHIVE_NAME);
+    let artifact = config.artifact_name();
+    let archive_path = staging.join(archive_name(artifact));
     let extracted_path = staging.join("extracted");
     fs::create_dir(&extracted_path)?;
     fs::set_permissions(&extracted_path, fs::Permissions::from_mode(0o700))?;
 
-    let downloaded_bytes = download_archive(&archive_path, progress)?;
+    let archive_bytes = download_file(
+        &archive_path,
+        &config.model_download_url(),
+        "model archive",
+        progress,
+    )?;
     extract_archive(&archive_path, &extracted_path, artifact)?;
     let model_root = extracted_path.join(artifact);
-    validate_model_files(&model_root)?;
+    let vad_bytes = if let Some(vad_url) = config.vad_download_url() {
+        download_file(&model_root.join(VAD_FILE), vad_url, "speech gate", progress)?
+    } else {
+        0
+    };
+    validate_model_files(
+        &model_root,
+        config.required_model_files(),
+        config.speech_gate,
+    )?;
     let replaced_existing = activate_model(&model_root, target)?;
-    Ok((downloaded_bytes, replaced_existing))
+    Ok((archive_bytes.saturating_add(vad_bytes), replaced_existing))
 }
 
-fn download_archive<F>(destination: &Path, progress: &mut F) -> Result<u64>
+fn download_file<F>(
+    destination: &Path,
+    download_url: &str,
+    description: &str,
+    progress: &mut F,
+) -> Result<u64>
 where
     F: FnMut(DownloadProgress),
 {
@@ -140,10 +151,9 @@ where
         .timeout_read(Duration::from_secs(30))
         .user_agent(concat!("nvstt/", env!("CARGO_PKG_VERSION")))
         .build();
-    let response = agent
-        .get(MODEL_DOWNLOAD_URL)
-        .call()
-        .map_err(|error| AppError::Unavailable(format!("model download failed: {error}")))?;
+    let response = agent.get(download_url).call().map_err(|error| {
+        AppError::Unavailable(format!("{description} download failed: {error}"))
+    })?;
     let total_bytes = response
         .header("content-length")
         .and_then(|value| value.parse::<u64>().ok());
@@ -164,7 +174,7 @@ where
 
     loop {
         let count = reader.read(&mut buffer).map_err(|error| {
-            AppError::Unavailable(format!("could not read model download: {error}"))
+            AppError::Unavailable(format!("could not read {description} download: {error}"))
         })?;
         if count == 0 {
             break;
@@ -190,10 +200,14 @@ where
         && total_bytes != downloaded_bytes
     {
         return Err(AppError::Unavailable(format!(
-            "model download was truncated: expected {total_bytes} bytes, received {downloaded_bytes}"
+            "{description} download was truncated: expected {total_bytes} bytes, received {downloaded_bytes}"
         )));
     }
     Ok(downloaded_bytes)
+}
+
+fn archive_name(artifact: &str) -> String {
+    format!("{artifact}.tar.bz2")
 }
 
 fn extract_archive(archive_path: &Path, destination: &Path, artifact: &str) -> Result<()> {
@@ -247,12 +261,30 @@ fn validate_archive_path(path: &Path, expected_root: &OsStr) -> Result<()> {
     }
 }
 
-fn validate_model_files(model_root: &Path) -> Result<()> {
-    for file in REQUIRED_FILES {
-        let path = model_root.join(file);
-        if !path.is_file() {
+fn validate_model_files(
+    model_root: &Path,
+    required_files: &[RequiredModelFileSpec],
+    require_vad: bool,
+) -> Result<()> {
+    for file in required_files {
+        if !file
+            .alternatives
+            .iter()
+            .map(|name| model_root.join(name))
+            .any(|path| path.is_file())
+        {
             return Err(AppError::Unavailable(format!(
-                "model archive is missing required file: {}",
+                "model archive is missing required {} file: {}",
+                file.name,
+                model_root.join(file.alternatives[0]).display()
+            )));
+        }
+    }
+    if require_vad {
+        let path = model_root.join(VAD_FILE);
+        if !path.is_file() || fs::metadata(&path)?.len() == 0 {
+            return Err(AppError::Unavailable(format!(
+                "model installation is missing required speech gate file: {}",
                 path.display()
             )));
         }
@@ -331,6 +363,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::config::ONLINE_TRANSDUCER_REQUIRED_FILES;
 
     fn fixture_archive(path: &Path, artifact: &str) {
         let file = File::create(path).expect("archive file");
@@ -339,7 +372,8 @@ mod tests {
         builder
             .append_dir(format!("{artifact}/"), ".")
             .expect("model directory");
-        for name in REQUIRED_FILES {
+        for file in ONLINE_TRANSDUCER_REQUIRED_FILES {
+            let name = file.alternatives[0];
             let contents = b"fixture";
             let mut header = Header::new_gnu();
             header.set_size(contents.len() as u64);
@@ -359,13 +393,18 @@ mod tests {
     #[test]
     fn extracts_and_validates_the_expected_file_set() {
         let directory = tempdir().expect("temporary directory");
-        let archive = directory.path().join(MODEL_ARCHIVE_NAME);
+        let archive = directory.path().join(archive_name("artifact"));
         let extracted = directory.path().join("extracted");
         fs::create_dir(&extracted).expect("extracted directory");
         fixture_archive(&archive, "artifact");
 
         extract_archive(&archive, &extracted, "artifact").expect("extract archive");
-        validate_model_files(&extracted.join("artifact")).expect("validate model");
+        validate_model_files(
+            &extracted.join("artifact"),
+            &ONLINE_TRANSDUCER_REQUIRED_FILES,
+            false,
+        )
+        .expect("validate model");
     }
 
     #[test]
@@ -373,5 +412,36 @@ mod tests {
         let error = validate_archive_path(Path::new("artifact/../escape"), OsStr::new("artifact"))
             .expect_err("parent traversal must be rejected");
         assert!(error.to_string().contains("unsafe path"));
+    }
+
+    #[test]
+    fn rejects_an_enabled_speech_gate_without_its_asset() {
+        let directory = tempdir().expect("temporary directory");
+        let model_root = directory.path().join("model");
+        fs::create_dir(&model_root).expect("model directory");
+        for file in ONLINE_TRANSDUCER_REQUIRED_FILES {
+            fs::write(model_root.join(file.alternatives[0]), b"fixture").expect("model file");
+        }
+
+        let error = validate_model_files(&model_root, &ONLINE_TRANSDUCER_REQUIRED_FILES, true)
+            .expect_err("VAD must be required");
+        assert!(error.to_string().contains("speech gate file"));
+    }
+
+    #[test]
+    fn activation_replaces_a_target_only_after_a_complete_source_exists() {
+        let directory = tempdir().expect("temporary directory");
+        let source = directory.path().join("source");
+        let target = directory.path().join("target");
+        fs::create_dir(&source).expect("source directory");
+        fs::write(source.join("marker"), b"new").expect("source marker");
+        fs::create_dir(&target).expect("target directory");
+        fs::write(target.join("marker"), b"old").expect("target marker");
+
+        assert!(activate_model(&source, &target).expect("activate replacement"));
+        assert_eq!(
+            fs::read(target.join("marker")).expect("target marker"),
+            b"new"
+        );
     }
 }

@@ -1,8 +1,10 @@
 pub mod app;
+pub mod audio;
 pub mod config;
 pub mod delivery;
 pub mod domain;
 pub mod error;
+pub mod evaluation;
 pub mod history;
 pub mod installer;
 pub mod ipc;
@@ -11,3 +13,4 @@ pub mod notifier;
 pub mod paths;
 pub mod recognizer;
 pub mod recorder;
+pub mod speech_gate;

@@ -19,6 +19,15 @@ pub enum DaemonState {
 pub struct StatusSnapshot {
     pub state: DaemonState,
     pub model: String,
+    /// Streaming latency profile selected for the configured model.
+    #[serde(default)]
+    pub streaming_profile: String,
+    /// Whether the local Silero speech gate is enabled for this model.
+    #[serde(default)]
+    pub speech_gate_enabled: bool,
+    /// Native inference provider selected by this binary.
+    #[serde(default)]
+    pub execution_provider: String,
     /// Whether all files for the configured model are present locally.
     #[serde(default)]
     pub model_ready: bool,
@@ -34,6 +43,7 @@ pub struct StatusSnapshot {
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptionStatus {
     NotStarted,
+    NoSpeech,
     Succeeded,
     Failed,
 }

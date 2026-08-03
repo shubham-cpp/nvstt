@@ -24,7 +24,8 @@ use crate::{
     notifier::{DesktopNotifier, NotificationEvent, Notifier},
     paths::AppPaths,
     recognizer::{
-        ParakeetRecognizer, StaticRecognizer, StreamingRecognizer, UnavailableRecognizer,
+        RecognitionOutcome, StaticRecognizer, StreamingRecognizer, UnavailableRecognizer,
+        create_recognizer, execution_provider,
     },
     recorder::{AudioSource, CpalRecorder, NoopRecorder, Recorder},
 };
@@ -42,7 +43,7 @@ enum WorkerCommand {
 
 struct WorkerCompletion {
     recognizer: Box<dyn StreamingRecognizer>,
-    transcript: Option<Result<String>>,
+    outcome: Option<Result<RecognitionOutcome>>,
 }
 
 impl RecognitionWorker {
@@ -62,7 +63,7 @@ impl RecognitionWorker {
         })
     }
 
-    fn finish(mut self) -> Result<(Box<dyn StreamingRecognizer>, Result<String>)> {
+    fn finish(mut self) -> Result<(Box<dyn StreamingRecognizer>, Result<RecognitionOutcome>)> {
         self.command_tx.send(WorkerCommand::Finish).map_err(|_| {
             AppError::Unavailable("recognition worker stopped unexpectedly".to_owned())
         })?;
@@ -75,12 +76,12 @@ impl RecognitionWorker {
         let completion = self.completion_rx.recv().map_err(|_| {
             AppError::Unavailable("recognition worker returned no result".to_owned())
         })?;
-        let transcript = completion.transcript.unwrap_or_else(|| {
+        let outcome = completion.outcome.unwrap_or_else(|| {
             Err(AppError::Unavailable(
                 "recognition worker canceled".to_owned(),
             ))
         });
-        Ok((completion.recognizer, transcript))
+        Ok((completion.recognizer, outcome))
     }
 
     fn cancel(mut self) -> Result<Box<dyn StreamingRecognizer>> {
@@ -107,7 +108,7 @@ fn run_recognition_worker(
     completion_tx: Sender<WorkerCompletion>,
 ) {
     let mut worker_error: Option<AppError> = None;
-    let transcript = loop {
+    let outcome = loop {
         if worker_error.is_none() {
             match source.drain() {
                 Ok(samples) if !samples.is_empty() => {
@@ -172,7 +173,7 @@ fn run_recognition_worker(
 
     let _ = completion_tx.send(WorkerCompletion {
         recognizer,
-        transcript,
+        outcome,
     });
 }
 
@@ -201,6 +202,9 @@ impl Daemon {
         let status = StatusSnapshot {
             state: DaemonState::Starting,
             model: config.model.clone(),
+            streaming_profile: config.streaming_profile.clone(),
+            speech_gate_enabled: config.speech_gate,
+            execution_provider: execution_provider().to_owned(),
             model_ready: false,
             model_path: None,
             message: "starting".to_owned(),
@@ -325,9 +329,13 @@ impl Daemon {
         self.session_started = Some(Instant::now());
         let model_ready = self.status.model_ready;
         let model_path = self.status.model_path.clone();
+        let execution_provider = self.status.execution_provider.clone();
         self.status = StatusSnapshot {
             state: DaemonState::Listening,
             model: self.config.model.clone(),
+            streaming_profile: self.config.streaming_profile.clone(),
+            speech_gate_enabled: self.config.speech_gate,
+            execution_provider,
             model_ready,
             model_path,
             message: "listening".to_owned(),
@@ -354,11 +362,11 @@ impl Daemon {
             }
         };
 
-        let transcript = if let Some(worker) = self.worker.take() {
+        let recognition = if let Some(worker) = self.worker.take() {
             match worker.finish() {
-                Ok((recognizer, Ok(transcript))) => {
+                Ok((recognizer, Ok(outcome))) => {
                     self.recognizer = Some(recognizer);
-                    transcript
+                    outcome
                 }
                 Ok((recognizer, Err(error))) => {
                     self.recognizer = Some(recognizer);
@@ -379,9 +387,14 @@ impl Daemon {
                 }
             }
             match recognizer.finish_session() {
-                Ok(transcript) => transcript,
+                Ok(outcome) => outcome,
                 Err(error) => return self.transcription_failure(error.to_string()),
             }
+        };
+
+        let transcript = match recognition {
+            RecognitionOutcome::NoSpeech => return self.no_speech(),
+            RecognitionOutcome::Transcript(transcript) => transcript,
         };
 
         if transcript.trim().is_empty() {
@@ -515,6 +528,18 @@ impl Daemon {
             reason,
             TranscriptionStatus::Failed,
             DeliveryStatus::NotAttempted,
+        )
+    }
+
+    fn no_speech(&mut self) -> IpcResponse {
+        self.session_started = None;
+        self.reset_to_idle();
+        self.safe_notify(NotificationEvent::NoSpeechDetected);
+        self.command_success(
+            None,
+            TranscriptionStatus::NoSpeech,
+            DeliveryStatus::NotAttempted,
+            "no speech detected; nothing was sent",
         )
     }
 
@@ -686,8 +711,8 @@ fn default_daemon(config: Config, paths: &AppPaths) -> Daemon {
             ),
             Err(_) => {
                 let model_dir = paths.model_dir.join(config.artifact_name());
-                match ParakeetRecognizer::from_model_dir(model_dir) {
-                    Ok(recognizer) => (Box::new(CpalRecorder::default()), Box::new(recognizer)),
+                match create_recognizer(&config, model_dir) {
+                    Ok(recognizer) => (Box::new(CpalRecorder::default()), recognizer),
                     Err(error) => (
                         Box::new(CpalRecorder::default()),
                         Box::new(UnavailableRecognizer::new(error.to_string())),
@@ -715,6 +740,41 @@ mod tests {
 
     use super::*;
     use crate::{delivery::StaticSink, history::JsonHistoryStore, notifier::NoopNotifier};
+
+    #[derive(Default)]
+    struct CountingRecognizer {
+        accepted_samples: usize,
+        active: bool,
+    }
+
+    impl StreamingRecognizer for CountingRecognizer {
+        fn start_session(&mut self) -> Result<()> {
+            self.active = true;
+            Ok(())
+        }
+
+        fn accept_audio(&mut self, _sample_rate: i32, samples: &[f32]) -> Result<()> {
+            if !self.active {
+                return Err(AppError::InvalidState(
+                    "recognizer is not active".to_owned(),
+                ));
+            }
+            self.accepted_samples += samples.len();
+            Ok(())
+        }
+
+        fn finish_session(&mut self) -> Result<RecognitionOutcome> {
+            self.active = false;
+            Ok(RecognitionOutcome::Transcript(
+                self.accepted_samples.to_string(),
+            ))
+        }
+
+        fn cancel_session(&mut self) -> Result<()> {
+            self.active = false;
+            Ok(())
+        }
+    }
 
     fn test_daemon(outcome: DeliveryOutcome) -> Daemon {
         let directory = tempdir().expect("temp directory");
@@ -769,6 +829,85 @@ mod tests {
                 assert_eq!(result.transcription, TranscriptionStatus::Succeeded);
                 assert_eq!(result.delivery, DeliveryStatus::Failed);
                 assert_eq!(result.transcript.as_deref(), Some("final transcript"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_speech_has_no_delivery_or_history_record() {
+        let directory = tempdir().expect("temporary directory");
+        let history_path = directory.path().join("history.json");
+        let mut daemon = Daemon::new(
+            Config::default(),
+            Box::new(NoopRecorder::default()),
+            Box::new(StaticRecognizer::no_speech()),
+            Box::new(StaticSink::new(DeliveryOutcome::Delivered {
+                backend: "test".to_owned(),
+            })),
+            Box::new(JsonHistoryStore::new(&history_path)),
+            Box::new(NoopNotifier::default()),
+        );
+        daemon.initialize();
+        let _ = daemon.handle(IpcRequest::Toggle);
+        let finish = daemon.handle(IpcRequest::Toggle);
+
+        match finish {
+            IpcResponse::Command { result } => {
+                assert!(result.ok);
+                assert!(result.transcript.is_none());
+                assert_eq!(result.transcription, TranscriptionStatus::NoSpeech);
+                assert_eq!(result.delivery, DeliveryStatus::NotAttempted);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        assert!(
+            JsonHistoryStore::new(&history_path)
+                .list(10)
+                .expect("list history")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn worker_drains_the_last_audio_before_final_flush() {
+        let samples = vec![0.25; 777];
+        let source = AudioSource::test_source(16_000, samples.clone());
+        let mut recognizer = CountingRecognizer::default();
+        recognizer.start_session().expect("start recognizer");
+        let worker = RecognitionWorker::spawn(Box::new(recognizer), source).expect("spawn worker");
+        let (_, outcome) = worker.finish().expect("finish worker");
+        assert_eq!(
+            outcome.expect("recognition outcome"),
+            RecognitionOutcome::Transcript(samples.len().to_string())
+        );
+    }
+
+    #[test]
+    fn parakeet_rollback_configuration_keeps_final_only_delivery() {
+        let directory = tempdir().expect("temporary directory");
+        let config = Config::for_model(crate::config::PARAKEET_UNIFIED_MODEL, "1120ms")
+            .expect("valid rollback config");
+        assert!(!config.speech_gate);
+        let mut daemon = Daemon::new(
+            config,
+            Box::new(NoopRecorder::default()),
+            Box::new(StaticRecognizer::new("rollback transcript")),
+            Box::new(StaticSink::new(DeliveryOutcome::Delivered {
+                backend: "test".to_owned(),
+            })),
+            Box::new(JsonHistoryStore::new(directory.path().join("history.json"))),
+            Box::new(NoopNotifier::default()),
+        );
+        daemon.initialize();
+        let _ = daemon.handle(IpcRequest::Toggle);
+        let finish = daemon.handle(IpcRequest::Toggle);
+
+        match finish {
+            IpcResponse::Command { result } => {
+                assert_eq!(result.status.model, crate::config::PARAKEET_UNIFIED_MODEL);
+                assert_eq!(result.transcript.as_deref(), Some("rollback transcript"));
+                assert_eq!(result.transcription, TranscriptionStatus::Succeeded);
             }
             other => panic!("unexpected response: {other:?}"),
         }

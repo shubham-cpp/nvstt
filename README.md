@@ -15,7 +15,8 @@ The repository contains a working native first release slice:
 - Final-only delivery contract.
 - CPAL default-input capture with mono downmix and sample-rate conversion.
 - Live bounded audio handoff to the recognizer while listening.
-- Parakeet Unified 0.6B INT8 streaming recognizer through sherpa-onnx.
+- Native Nemotron streaming 0.6B INT8 recognizer through sherpa-onnx.
+- Local Silero VAD gate with final-only delivery and no-speech results.
 - Native-first text delivery through the XDG RemoteDesktop portal/libei path.
 - Runtime-probed `zwp_virtual_keyboard_v1` fallback for wlroots/Smithay WMs.
 - Clipboard fallback with the native-delivery failure reason in the result.
@@ -38,31 +39,34 @@ installed before listening can start. `nvstt status` reports model readiness;
 
 ## Configuration
 
-The only user setting is the model name. If the file does not exist, nvstt
-uses Parakeet Unified by default. Create
-`$XDG_CONFIG_HOME/nvstt/config.toml` (normally
+If the file does not exist, nvstt selects Nemotron streaming with its local
+speech gate. Create `$XDG_CONFIG_HOME/nvstt/config.toml` (normally
 `~/.config/nvstt/config.toml`) with:
 
 ```toml
-model = "parakeet-unified-en-0.6b"
+[model]
+name = "nemotron-speech-streaming-en-0.6b"
+streaming_profile = "560ms"
+speech_gate = true
 ```
 
-The loader also accepts the older `[model] name = "..."` form. Parakeet
-Unified is the only supported model in this release; another value produces a
-clear configuration error.
+The closed registry supports Nemotron profiles 80 ms, 160 ms, 560 ms, and
+1120 ms. It also supports Parakeet Unified profiles 240 ms, 560 ms, and
+1120 ms for rollback. Existing Parakeet configuration does not enable VAD
+unless it sets `speech_gate = true`.
 
 ## Model files
 
-Place the extracted
-`sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-560ms` archive at:
+The selected model directory contains its encoder, decoder, joiner, token
+files, and, when enabled, `silero_vad.onnx`. A new default install selects:
 
 ```text
-$XDG_DATA_HOME/nvstt/models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-560ms/
+$XDG_DATA_HOME/nvstt/models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25/
 ```
 
 The directory must contain `encoder.int8.onnx`, `decoder.int8.onnx`,
-`joiner.int8.onnx`, and `tokens.txt`. If `XDG_DATA_HOME` is not set, use
-`~/.local/share/nvstt/models/`.
+`joiner.int8.onnx`, `tokens.txt`, and `silero_vad.onnx`. If `XDG_DATA_HOME`
+is not set, use `~/.local/share/nvstt/models/`.
 
 Install the model explicitly with:
 
@@ -71,16 +75,40 @@ nvstt model install
 ```
 
 The command downloads the pinned official sherpa-onnx archive only when you
-call it. It shows progress, validates the four required model files, and
-activates the model only after extraction succeeds. An incomplete existing
-installation is replaced atomically. Network failures leave the active model
-directory unchanged.
+call it. It validates all required ASR and VAD files, then activates both
+only after extraction succeeds. An incomplete existing installation is
+replaced atomically. Network failures leave the active model directory
+unchanged.
 
-## Verify a model with a WAV file
+Install a candidate without changing the active configuration:
 
-The repository includes a small verification example. It reads a 16-bit PCM
-WAV file and runs the same Parakeet recognizer that the daemon uses. It does
-not require a microphone, a daemon, or a Wayland session:
+```bash
+nvstt model install --model nemotron-speech-streaming-en-0.6b --streaming-profile 560ms
+nvstt model status --model nemotron-speech-streaming-en-0.6b --streaming-profile 560ms --json
+```
+
+## Evaluate a model with a private corpus
+
+Use `nvstt model evaluate` for an accuracy and finalization report. The JSONL
+manifest stays private. Relative WAV paths resolve from its directory:
+
+```json
+{"id":"short-1","audio":"audio/short-1.wav","reference":"example text","category":"short_dictation"}
+```
+
+```bash
+nvstt model evaluate --manifest /private/corpus/manifest.jsonl \
+  --model nemotron-speech-streaming-en-0.6b --streaming-profile 560ms --json
+```
+
+The report includes each hypothesis, S/D/I counts, WER, silent-clip failures,
+and finalization latency. It never delivers text or changes configuration.
+
+## Verify a Parakeet model with a WAV file
+
+The repository includes a small Parakeet verification example. It reads a
+16-bit PCM WAV file. It does not require a microphone, daemon, or Wayland
+session:
 
 ```bash
 cargo run --example transcribe_wav -- \
@@ -153,9 +181,10 @@ nvstt toggle                 # start, then stop and deliver
 nvstt cancel                 # cancel an active session
 nvstt status [--json]        # daemon and model readiness
 nvstt history [--json]      # last ten successful transcripts
-nvstt model install         # explicitly download and install Parakeet
+nvstt model install         # explicitly download the selected model and VAD
 nvstt model status [--json] # local model file check
 nvstt model path             # expected model directory
+nvstt model evaluate --manifest PATH --json # private-corpus report
 ```
 
 See [IMPLEMENTATION_SPEC.md](./IMPLEMENTATION_SPEC.md) for the accepted
