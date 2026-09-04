@@ -102,7 +102,9 @@ private staging directory and activates it only after extraction succeeds.
 Use `cpal` for the first capture implementation. Prefer the desktop default
 source. Convert input to mono floating-point PCM at the recorder boundary. The
 audio callback must not perform model inference or blocking I/O. The worker
-resamples the bounded queue to 16 kHz before recognition.
+resamples the bounded queue to 16 kHz before recognition. It uses FFT
+resampling. Optional RNNoise processing runs in the worker at 48 kHz before
+the final 16 kHz conversion.
 
 Do not add VAD or automatic stop in the first slice. Manual toggle defines the
 session boundary. Add VAD later as an optional mode.

@@ -11,8 +11,10 @@ use tokio::net::UnixListener;
 use tracing::{info, warn};
 
 use crate::{
+    audio_pipeline::{AudioPipeline, MODEL_SAMPLE_RATE},
     config::Config,
     delivery::{NativeFirstSink, TextSink},
+    dictation_transcript::{DictationTranscript, EmptyTranscript, dictation_transcript},
     domain::{
         DaemonState, DeliveryOutcome, DeliveryStatus, HistoryRecord, StatusSnapshot,
         TranscriptionStatus, new_session_id,
@@ -47,12 +49,18 @@ struct WorkerCompletion {
 }
 
 impl RecognitionWorker {
-    fn spawn(recognizer: Box<dyn StreamingRecognizer>, source: AudioSource) -> Result<Self> {
+    fn spawn(
+        recognizer: Box<dyn StreamingRecognizer>,
+        source: AudioSource,
+        denoise: bool,
+    ) -> Result<Self> {
         let (command_tx, command_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("nvstt-recognizer".to_owned())
-            .spawn(move || run_recognition_worker(recognizer, source, command_rx, completion_tx))
+            .spawn(move || {
+                run_recognition_worker(recognizer, source, denoise, command_rx, completion_tx)
+            })
             .map_err(|error| {
                 AppError::Unavailable(format!("could not start recognition worker: {error}"))
             })?;
@@ -104,55 +112,28 @@ impl RecognitionWorker {
 fn run_recognition_worker(
     mut recognizer: Box<dyn StreamingRecognizer>,
     source: AudioSource,
+    denoise: bool,
     command_rx: Receiver<WorkerCommand>,
     completion_tx: Sender<WorkerCompletion>,
 ) {
+    let mut audio_pipeline = AudioPipeline::new(denoise);
     let mut worker_error: Option<AppError> = None;
     let outcome = loop {
-        if worker_error.is_none() {
-            match source.drain() {
-                Ok(samples) if !samples.is_empty() => {
-                    if let Err(error) = recognizer.accept_audio(source.sample_rate(), &samples) {
-                        worker_error = Some(error);
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => worker_error = Some(error),
-            }
-        }
+        feed_audio_if_healthy(
+            &source,
+            recognizer.as_mut(),
+            &mut audio_pipeline,
+            &mut worker_error,
+        );
 
         match command_rx.recv_timeout(Duration::from_millis(20)) {
             Ok(WorkerCommand::Finish) => {
-                if worker_error.is_none() {
-                    loop {
-                        match source.drain() {
-                            Ok(samples) if !samples.is_empty() => {
-                                if let Err(error) =
-                                    recognizer.accept_audio(source.sample_rate(), &samples)
-                                {
-                                    worker_error = Some(error);
-                                    break;
-                                }
-                            }
-                            Ok(_) => break,
-                            Err(error) => {
-                                worker_error = Some(error);
-                                break;
-                            }
-                        }
-                    }
-                }
-                if worker_error.is_none() {
-                    match source.overflowed() {
-                        Ok(true) => {
-                            worker_error = Some(AppError::Unavailable(
-                                "audio capture exceeded the 30 minute limit".to_owned(),
-                            ));
-                        }
-                        Ok(false) => {}
-                        Err(error) => worker_error = Some(error),
-                    }
-                }
+                finish_audio_if_healthy(
+                    &source,
+                    recognizer.as_mut(),
+                    &mut audio_pipeline,
+                    &mut worker_error,
+                );
                 break Some(match worker_error {
                     Some(error) => Err(error),
                     None => recognizer.finish_session(),
@@ -175,6 +156,85 @@ fn run_recognition_worker(
         recognizer,
         outcome,
     });
+}
+
+fn feed_audio_if_healthy(
+    source: &AudioSource,
+    recognizer: &mut dyn StreamingRecognizer,
+    audio_pipeline: &mut AudioPipeline,
+    worker_error: &mut Option<AppError>,
+) {
+    if worker_error.is_none() {
+        *worker_error = feed_available_audio(source, recognizer, audio_pipeline).err();
+    }
+}
+
+fn finish_audio_if_healthy(
+    source: &AudioSource,
+    recognizer: &mut dyn StreamingRecognizer,
+    audio_pipeline: &mut AudioPipeline,
+    worker_error: &mut Option<AppError>,
+) {
+    if worker_error.is_none() {
+        *worker_error = finish_audio(source, recognizer, audio_pipeline).err();
+    }
+}
+
+fn feed_available_audio(
+    source: &AudioSource,
+    recognizer: &mut dyn StreamingRecognizer,
+    audio_pipeline: &mut AudioPipeline,
+) -> Result<()> {
+    let samples = source.drain()?;
+    if samples.is_empty() {
+        return Ok(());
+    }
+    feed_recognizer(recognizer, audio_pipeline, source.sample_rate(), &samples)
+}
+
+fn drain_audio(
+    source: &AudioSource,
+    recognizer: &mut dyn StreamingRecognizer,
+    audio_pipeline: &mut AudioPipeline,
+) -> Result<()> {
+    loop {
+        let samples = source.drain()?;
+        if samples.is_empty() {
+            return Ok(());
+        }
+        feed_recognizer(recognizer, audio_pipeline, source.sample_rate(), &samples)?;
+    }
+}
+
+fn finish_audio(
+    source: &AudioSource,
+    recognizer: &mut dyn StreamingRecognizer,
+    audio_pipeline: &mut AudioPipeline,
+) -> Result<()> {
+    drain_audio(source, recognizer, audio_pipeline)?;
+    let samples = audio_pipeline.finish()?;
+    if !samples.is_empty() {
+        recognizer.accept_audio(MODEL_SAMPLE_RATE, &samples)?;
+    }
+    if source.overflowed()? {
+        return Err(AppError::Unavailable(
+            "audio capture exceeded the 30 minute limit".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn feed_recognizer(
+    recognizer: &mut dyn StreamingRecognizer,
+    audio_pipeline: &mut AudioPipeline,
+    sample_rate: i32,
+    samples: &[f32],
+) -> Result<()> {
+    let samples = audio_pipeline.accept_audio(sample_rate, samples)?;
+    if !samples.is_empty() {
+        recognizer.accept_audio(MODEL_SAMPLE_RATE, &samples)?;
+    }
+    Ok(())
 }
 
 pub struct Daemon {
@@ -307,22 +367,33 @@ impl Daemon {
             );
         }
 
-        if let Some(source) = self.recorder.audio_source() {
-            match RecognitionWorker::spawn(recognizer, source) {
-                Ok(worker) => self.worker = Some(worker),
-                Err(error) => {
-                    let _ = self.recorder.cancel();
-                    self.recognizer = Some(Box::new(UnavailableRecognizer::new(error.to_string())));
-                    return self.command_failure(
-                        "recognizer_unavailable",
-                        error.to_string(),
-                        TranscriptionStatus::NotStarted,
-                        DeliveryStatus::NotAttempted,
-                    );
-                }
+        let source = match self.recorder.audio_source() {
+            Ok(source) => source,
+            Err(error) => {
+                let _ = self.recorder.cancel();
+                let _ = recognizer.cancel_session();
+                self.recognizer = Some(recognizer);
+                return self.command_failure(
+                    "recorder_unavailable",
+                    error.to_string(),
+                    TranscriptionStatus::NotStarted,
+                    DeliveryStatus::NotAttempted,
+                );
             }
-        } else {
-            self.recognizer = Some(recognizer);
+        };
+
+        match RecognitionWorker::spawn(recognizer, source, self.config.denoise) {
+            Ok(worker) => self.worker = Some(worker),
+            Err(error) => {
+                let _ = self.recorder.cancel();
+                self.recognizer = Some(Box::new(UnavailableRecognizer::new(error.to_string())));
+                return self.command_failure(
+                    "recognizer_unavailable",
+                    error.to_string(),
+                    TranscriptionStatus::NotStarted,
+                    DeliveryStatus::NotAttempted,
+                );
+            }
         }
 
         let session_id = new_session_id();
@@ -355,53 +426,28 @@ impl Daemon {
         self.status.message = "finalizing".to_owned();
         self.safe_notify(NotificationEvent::Finalizing);
 
-        let captured_audio = match self.recorder.stop() {
-            Ok(audio) => audio,
-            Err(error) => {
-                return self.transcription_failure(error.to_string());
-            }
-        };
-
-        let recognition = if let Some(worker) = self.worker.take() {
-            match worker.finish() {
-                Ok((recognizer, Ok(outcome))) => {
-                    self.recognizer = Some(recognizer);
-                    outcome
-                }
-                Ok((recognizer, Err(error))) => {
-                    self.recognizer = Some(recognizer);
-                    return self.transcription_failure(error.to_string());
-                }
-                Err(error) => return self.transcription_failure(error.to_string()),
-            }
-        } else {
-            let Some(recognizer) = self.recognizer.as_mut() else {
-                return self.transcription_failure("recognizer is not available".to_owned());
-            };
-            if let Some(audio) = captured_audio {
-                let chunk_size = (audio.sample_rate.max(1) as usize / 10).max(1);
-                for chunk in audio.samples.chunks(chunk_size) {
-                    if let Err(error) = recognizer.accept_audio(audio.sample_rate, chunk) {
-                        return self.transcription_failure(error.to_string());
-                    }
-                }
-            }
-            match recognizer.finish_session() {
-                Ok(outcome) => outcome,
-                Err(error) => return self.transcription_failure(error.to_string()),
-            }
-        };
-
-        let transcript = match recognition {
-            RecognitionOutcome::NoSpeech => return self.no_speech(),
-            RecognitionOutcome::Transcript(transcript) => transcript,
-        };
-
-        if transcript.trim().is_empty() {
-            return self.transcription_failure("transcript was empty".to_owned());
+        if let Err(error) = self.recorder.stop() {
+            return self.transcription_failure(error.to_string());
         }
-        let transcript = transcript.trim().to_owned();
 
+        let recognition = match self.finish_recognition_worker() {
+            Ok(outcome) => outcome,
+            Err(error) => return self.transcription_failure(error.to_string()),
+        };
+
+        let transcript =
+            match dictation_transcript(recognition, &self.config.replacements, self.config.itn) {
+                Ok(DictationTranscript::NoContent) => return self.no_speech(),
+                Ok(DictationTranscript::Ready(transcript)) => transcript,
+                Err(EmptyTranscript) => {
+                    return self.transcription_failure("transcript was empty".to_owned());
+                }
+            };
+
+        self.deliver_transcript(transcript)
+    }
+
+    fn deliver_transcript(&mut self, transcript: String) -> IpcResponse {
         self.safe_notify(NotificationEvent::Transcribed);
         let id = self
             .status
@@ -541,6 +587,15 @@ impl Daemon {
             DeliveryStatus::NotAttempted,
             "no speech detected; nothing was sent",
         )
+    }
+
+    fn finish_recognition_worker(&mut self) -> Result<RecognitionOutcome> {
+        let worker = self.worker.take().ok_or_else(|| {
+            AppError::Unavailable("recognition worker is not available".to_owned())
+        })?;
+        let (recognizer, outcome) = worker.finish()?;
+        self.recognizer = Some(recognizer);
+        outcome
     }
 
     fn reset_to_idle(&mut self) {
@@ -739,7 +794,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{delivery::StaticSink, history::JsonHistoryStore, notifier::NoopNotifier};
+    use crate::{
+        delivery::StaticSink, dictation_transcript::Replacements, history::JsonHistoryStore,
+        notifier::NoopNotifier,
+    };
 
     #[derive(Default)]
     struct CountingRecognizer {
@@ -835,6 +893,148 @@ mod tests {
     }
 
     #[test]
+    fn filled_pauses_are_removed_before_history_and_delivery() {
+        let directory = tempdir().expect("temporary directory");
+        let history_path = directory.path().join("history.json");
+        let mut daemon = Daemon::new(
+            Config::default(),
+            Box::new(NoopRecorder::default()),
+            Box::new(StaticRecognizer::new("uh hello um world")),
+            Box::new(StaticSink::new(DeliveryOutcome::Delivered {
+                backend: "test".to_owned(),
+            })),
+            Box::new(JsonHistoryStore::new(&history_path)),
+            Box::new(NoopNotifier::default()),
+        );
+        daemon.initialize();
+        let _ = daemon.handle(IpcRequest::Toggle);
+        let finish = daemon.handle(IpcRequest::Toggle);
+
+        match finish {
+            IpcResponse::Command { result } => {
+                assert_eq!(result.transcript.as_deref(), Some("hello world"));
+                assert_eq!(result.transcription, TranscriptionStatus::Succeeded);
+                assert_eq!(result.delivery, DeliveryStatus::Delivered);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        let records = JsonHistoryStore::new(&history_path)
+            .list(10)
+            .expect("list history");
+        assert_eq!(records[0].transcript, "hello world");
+    }
+
+    #[test]
+    fn short_stutters_are_collapsed_before_history_and_delivery() {
+        let mut daemon = test_daemon(DeliveryOutcome::Delivered {
+            backend: "test".to_owned(),
+        });
+        daemon.recognizer = Some(Box::new(StaticRecognizer::new("I I I I think")));
+        daemon.initialize();
+        let _ = daemon.handle(IpcRequest::Toggle);
+        let finish = daemon.handle(IpcRequest::Toggle);
+        match finish {
+            IpcResponse::Command { result } => {
+                assert_eq!(result.transcript.as_deref(), Some("I think"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replacements_are_applied_before_history_and_delivery() {
+        let directory = tempdir().expect("temporary directory");
+        let history_path = directory.path().join("history.json");
+        let config = Config {
+            replacements: Replacements::from_pairs([("nv stt".to_owned(), "nvstt".to_owned())]),
+            ..Config::default()
+        };
+        let mut daemon = Daemon::new(
+            config,
+            Box::new(NoopRecorder::default()),
+            Box::new(StaticRecognizer::new("uh nv stt")),
+            Box::new(StaticSink::new(DeliveryOutcome::Delivered {
+                backend: "test".to_owned(),
+            })),
+            Box::new(JsonHistoryStore::new(&history_path)),
+            Box::new(NoopNotifier::default()),
+        );
+        daemon.initialize();
+        let _ = daemon.handle(IpcRequest::Toggle);
+        let finish = daemon.handle(IpcRequest::Toggle);
+        match finish {
+            IpcResponse::Command { result } => {
+                assert_eq!(result.transcript.as_deref(), Some("nvstt"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_itn_is_applied_before_history_and_delivery() {
+        let directory = tempdir().expect("temporary directory");
+        let history_path = directory.path().join("history.json");
+        let mut daemon = Daemon::new(
+            Config::default(),
+            Box::new(NoopRecorder::default()),
+            Box::new(StaticRecognizer::new("I have twenty one apples")),
+            Box::new(StaticSink::new(DeliveryOutcome::Delivered {
+                backend: "test".to_owned(),
+            })),
+            Box::new(JsonHistoryStore::new(&history_path)),
+            Box::new(NoopNotifier::default()),
+        );
+        daemon.initialize();
+        let _ = daemon.handle(IpcRequest::Toggle);
+        let finish = daemon.handle(IpcRequest::Toggle);
+        match finish {
+            IpcResponse::Command { result } => {
+                assert_eq!(result.transcript.as_deref(), Some("I have 21 apples"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        let records = JsonHistoryStore::new(&history_path)
+            .list(10)
+            .expect("list history");
+        assert_eq!(records[0].transcript, "I have 21 apples");
+    }
+
+    #[test]
+    fn filler_only_speech_has_no_delivery_or_history_record() {
+        let directory = tempdir().expect("temporary directory");
+        let history_path = directory.path().join("history.json");
+        let mut daemon = Daemon::new(
+            Config::default(),
+            Box::new(NoopRecorder::default()),
+            Box::new(StaticRecognizer::new("um uh um.")),
+            Box::new(StaticSink::new(DeliveryOutcome::Delivered {
+                backend: "test".to_owned(),
+            })),
+            Box::new(JsonHistoryStore::new(&history_path)),
+            Box::new(NoopNotifier::default()),
+        );
+        daemon.initialize();
+        let _ = daemon.handle(IpcRequest::Toggle);
+        let finish = daemon.handle(IpcRequest::Toggle);
+
+        match finish {
+            IpcResponse::Command { result } => {
+                assert!(result.ok);
+                assert!(result.transcript.is_none());
+                assert_eq!(result.transcription, TranscriptionStatus::NoSpeech);
+                assert_eq!(result.delivery, DeliveryStatus::NotAttempted);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        assert!(
+            JsonHistoryStore::new(&history_path)
+                .list(10)
+                .expect("list history")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn no_speech_has_no_delivery_or_history_record() {
         let directory = tempdir().expect("temporary directory");
         let history_path = directory.path().join("history.json");
@@ -875,7 +1075,8 @@ mod tests {
         let source = AudioSource::test_source(16_000, samples.clone());
         let mut recognizer = CountingRecognizer::default();
         recognizer.start_session().expect("start recognizer");
-        let worker = RecognitionWorker::spawn(Box::new(recognizer), source).expect("spawn worker");
+        let worker =
+            RecognitionWorker::spawn(Box::new(recognizer), source, false).expect("spawn worker");
         let (_, outcome) = worker.finish().expect("finish worker");
         assert_eq!(
             outcome.expect("recognition outcome"),

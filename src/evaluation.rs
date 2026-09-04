@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     audio::read_wav,
+    audio_pipeline::{AudioPipeline, MODEL_SAMPLE_RATE},
     config::Config,
     error::{AppError, Result},
     model::ModelStatus,
@@ -195,13 +196,15 @@ fn transcribe_waveform(
     samples: &[f32],
 ) -> Result<RecognitionMeasurement> {
     recognizer.start_session()?;
+    let mut audio_pipeline = AudioPipeline::new(false);
     let chunk_size = ((sample_rate.max(1) as usize * FEED_CHUNK_MILLISECONDS) / 1_000).max(1);
     let mut samples_before = 0usize;
     let mut worker_ready_at = Duration::ZERO;
     for chunk in samples.chunks(chunk_size) {
         let arrival_at = audio_duration(samples_before, sample_rate);
         let processing_started = Instant::now();
-        if let Err(error) = recognizer.accept_audio(sample_rate, chunk) {
+        if let Err(error) = feed_pipeline_audio(recognizer, &mut audio_pipeline, sample_rate, chunk)
+        {
             let _ = recognizer.cancel_session();
             return Err(error);
         }
@@ -211,6 +214,10 @@ fn transcribe_waveform(
     let release_at = audio_duration(samples.len(), sample_rate);
     let pre_stop_backlog = worker_ready_at.saturating_sub(release_at);
     let finalization_started = Instant::now();
+    if let Err(error) = finish_pipeline_audio(recognizer, &mut audio_pipeline) {
+        let _ = recognizer.cancel_session();
+        return Err(error);
+    }
     let outcome = recognizer.finish_session()?;
     let model_finalization = finalization_started.elapsed();
     let text = match outcome {
@@ -223,6 +230,31 @@ fn transcribe_waveform(
         pre_stop_backlog_ms: duration_to_ms(pre_stop_backlog),
         finalization_latency_ms: duration_to_ms(pre_stop_backlog + model_finalization),
     })
+}
+
+fn feed_pipeline_audio(
+    recognizer: &mut dyn StreamingRecognizer,
+    audio_pipeline: &mut AudioPipeline,
+    sample_rate: i32,
+    samples: &[f32],
+) -> Result<()> {
+    let converted = audio_pipeline.accept_audio(sample_rate, samples)?;
+    feed_converted_audio(recognizer, &converted)
+}
+
+fn finish_pipeline_audio(
+    recognizer: &mut dyn StreamingRecognizer,
+    audio_pipeline: &mut AudioPipeline,
+) -> Result<()> {
+    let converted = audio_pipeline.finish()?;
+    feed_converted_audio(recognizer, &converted)
+}
+
+fn feed_converted_audio(recognizer: &mut dyn StreamingRecognizer, samples: &[f32]) -> Result<()> {
+    if !samples.is_empty() {
+        recognizer.accept_audio(MODEL_SAMPLE_RATE, samples)?;
+    }
+    Ok(())
 }
 
 fn audio_duration(samples: usize, sample_rate: i32) -> Duration {

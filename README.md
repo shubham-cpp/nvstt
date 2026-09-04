@@ -48,7 +48,25 @@ speech gate. Create `$XDG_CONFIG_HOME/nvstt/config.toml` (normally
 name = "nemotron-speech-streaming-en-0.6b"
 streaming_profile = "560ms"
 speech_gate = true
+
+[audio]
+denoise = false
+
+[text]
+itn = true
+
+[text.replacements]
+"nv stt" = "nvstt"
+parakeet = "Parakeet"
 ```
+
+The audio worker uses FFT resampling for all non-16 kHz input. Set
+`audio.denoise = true` to enable RNNoise before recognition. Denoise is off by
+default.
+
+Inverse text normalization is on by default. It converts spoken numbers,
+dates, money, and measurements to written forms. Set `text.itn = false` to
+keep the spoken forms. The phrase `give me a second` keeps the word `second`.
 
 The closed registry supports Nemotron profiles 80 ms, 160 ms, 560 ms, and
 1120 ms. It also supports Parakeet Unified profiles 240 ms, 560 ms, and

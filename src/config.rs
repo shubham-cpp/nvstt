@@ -2,7 +2,10 @@ use std::{fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{AppError, Result};
+use crate::{
+    dictation_transcript::Replacements,
+    error::{AppError, Result},
+};
 
 /// The model selected for a new installation.
 pub const DEFAULT_MODEL: &str = "nemotron-speech-streaming-en-0.6b";
@@ -132,6 +135,10 @@ fn default_speech_gate() -> bool {
     true
 }
 
+fn default_itn() -> bool {
+    true
+}
+
 fn default_speech_gate_for_model(model: &str) -> bool {
     model == NEMOTRON_STREAMING_MODEL
 }
@@ -144,6 +151,12 @@ pub struct Config {
     pub streaming_profile: String,
     #[serde(default = "default_speech_gate")]
     pub speech_gate: bool,
+    #[serde(default)]
+    pub denoise: bool,
+    #[serde(default = "default_itn")]
+    pub itn: bool,
+    #[serde(default)]
+    pub replacements: Replacements,
 }
 
 impl Default for Config {
@@ -152,6 +165,9 @@ impl Default for Config {
             model: default_model(),
             streaming_profile: default_streaming_profile(),
             speech_gate: default_speech_gate(),
+            denoise: false,
+            itn: default_itn(),
+            replacements: Replacements::default(),
         }
     }
 }
@@ -192,10 +208,16 @@ impl Config {
             .or_else(|| nested_bool(&value, "speech_gate"))
             // Preserve a pre-Nemotron Parakeet configuration exactly as it was.
             .unwrap_or_else(|| default_speech_gate_for_model(&model));
+        let denoise = section_bool(&value, "audio", "denoise").unwrap_or(false);
+        let itn = section_bool(&value, "text", "itn").unwrap_or_else(default_itn);
+        let replacements = parse_replacements(&value)?;
         let config = Self {
             model,
             streaming_profile,
             speech_gate,
+            denoise,
+            itn,
+            replacements,
         };
         config.validate()?;
         Ok(config)
@@ -211,6 +233,9 @@ impl Config {
             speech_gate: default_speech_gate_for_model(&model),
             model,
             streaming_profile: streaming_profile.into(),
+            denoise: false,
+            itn: default_itn(),
+            replacements: Replacements::default(),
         };
         config.validate()?;
         Ok(config)
@@ -231,6 +256,9 @@ impl Config {
             },
             model,
             streaming_profile: streaming_profile.unwrap_or_else(|| self.streaming_profile.clone()),
+            denoise: self.denoise,
+            itn: self.itn,
+            replacements: self.replacements.clone(),
         };
         config.validate()?;
         Ok(config)
@@ -306,6 +334,36 @@ impl Config {
     }
 }
 
+fn parse_replacements(value: &toml::Value) -> Result<Replacements> {
+    let Some(table) = value
+        .get("text")
+        .and_then(|text| text.get("replacements"))
+        .or_else(|| value.get("replacements"))
+    else {
+        return Ok(Replacements::default());
+    };
+    let Some(map) = table.as_table() else {
+        return Err(AppError::Config(
+            "`replacements` must be a table of string to string".to_owned(),
+        ));
+    };
+    let mut pairs = Vec::new();
+    for (pattern, replacement) in map {
+        let Some(replacement) = replacement.as_str() else {
+            return Err(AppError::Config(format!(
+                "replacement for '{pattern}' must be a string"
+            )));
+        };
+        if pattern.split_whitespace().next().is_none() {
+            return Err(AppError::Config(
+                "replacement pattern must not be empty".to_owned(),
+            ));
+        }
+        pairs.push((pattern.clone(), replacement.to_owned()));
+    }
+    Ok(Replacements::from_pairs(pairs))
+}
+
 fn nested_string(value: &toml::Value, field: &str) -> Option<String> {
     value
         .get("model")
@@ -323,6 +381,14 @@ fn nested_bool(value: &toml::Value, field: &str) -> Option<bool> {
         .and_then(toml::Value::as_bool)
 }
 
+fn section_bool(value: &toml::Value, section: &str, field: &str) -> Option<bool> {
+    value
+        .get(section)
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get(field))
+        .and_then(toml::Value::as_bool)
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -335,6 +401,8 @@ mod tests {
         assert_eq!(config.model, NEMOTRON_STREAMING_MODEL);
         assert_eq!(config.streaming_profile, "560ms");
         assert!(config.speech_gate);
+        assert!(!config.denoise);
+        assert!(config.itn);
         assert_eq!(
             config.artifact_name(),
             "sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25"
@@ -379,6 +447,49 @@ mod tests {
             config.recognizer_family(),
             Some(RecognizerFamily::OnlineTransducer)
         );
+    }
+
+    #[test]
+    fn loads_text_replacements() {
+        let directory = tempdir().expect("temporary config directory");
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "[model]\nname = \"nemotron-speech-streaming-en-0.6b\"\n[text.replacements]\n\"nv stt\" = \"nvstt\"\nparakeet = \"Parakeet\"\n",
+        )
+        .expect("write config");
+        let config = Config::load(&path).expect("load config");
+        let outcome =
+            crate::recognizer::RecognitionOutcome::Transcript("nv stt uses parakeet".to_owned());
+        match crate::dictation_transcript::dictation_transcript(
+            outcome,
+            &config.replacements,
+            config.itn,
+        ) {
+            Ok(crate::dictation_transcript::DictationTranscript::Ready(text)) => {
+                assert_eq!(text, "nvstt uses Parakeet");
+            }
+            other => panic!("unexpected dictation content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loads_audio_and_text_pipeline_options() {
+        let directory = tempdir().expect("temporary config directory");
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "[audio]\ndenoise = true\n[text]\nitn = false\n").expect("write config");
+        let config = Config::load(&path).expect("load config");
+        assert!(config.denoise);
+        assert!(!config.itn);
+    }
+
+    #[test]
+    fn rejects_a_non_string_replacement() {
+        let directory = tempdir().expect("temporary config directory");
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "[text.replacements]\nfoo = 1\n").expect("write config");
+        let error = Config::load(&path).expect_err("non-string replacement");
+        assert!(error.to_string().contains("must be a string"));
     }
 
     #[test]

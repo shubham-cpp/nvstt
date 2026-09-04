@@ -5,11 +5,14 @@
 
 use std::{collections::VecDeque, path::Path};
 
-use sherpa_onnx::{LinearResampler, SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
+use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 
-use crate::error::{AppError, Result};
+use crate::{
+    audio_pipeline::MODEL_SAMPLE_RATE,
+    error::{AppError, Result},
+};
 
-pub const VAD_SAMPLE_RATE: i32 = 16_000;
+pub const VAD_SAMPLE_RATE: i32 = MODEL_SAMPLE_RATE;
 const VAD_FRAME_SAMPLES: usize = 512;
 const PRE_ROLL_SAMPLES: usize = 6_400;
 const SILENCE_BRIDGE_SAMPLES: usize = 3_200;
@@ -76,40 +79,30 @@ impl GateState {
     }
 }
 
-/// Input-rate conversion and exact VAD framing. This is separate from the
-/// detector so edge cases do not need an installed VAD model in unit tests.
+/// Exact VAD framing. This is separate from the detector so edge cases do not
+/// need an installed VAD model in unit tests.
 struct GateInput {
-    resampler: Option<LinearResampler>,
-    input_sample_rate: Option<i32>,
     pending: Vec<f32>,
 }
 
 impl GateInput {
     fn new() -> Self {
         Self {
-            resampler: None,
-            input_sample_rate: None,
             pending: Vec::new(),
         }
     }
 
     fn accept_audio(&mut self, sample_rate: i32, samples: &[f32]) -> Result<Vec<Vec<f32>>> {
-        self.validate_sample_rate(sample_rate)?;
-        let samples = if let Some(resampler) = &self.resampler {
-            resampler.resample(samples, false)
-        } else {
-            samples.to_vec()
-        };
-        Ok(self.accept_16khz(&samples))
+        if sample_rate != VAD_SAMPLE_RATE {
+            return Err(AppError::Unavailable(format!(
+                "speech gate requires {VAD_SAMPLE_RATE} Hz audio, got {sample_rate} Hz"
+            )));
+        }
+        Ok(self.accept_16khz(samples))
     }
 
     fn finish_session(&mut self) -> Vec<Vec<f32>> {
-        let mut frames = if let Some(resampler) = &self.resampler {
-            let samples = resampler.resample(&[], true);
-            self.accept_16khz(&samples)
-        } else {
-            Vec::new()
-        };
+        let mut frames = Vec::new();
         if !self.pending.is_empty() {
             let mut last_frame = std::mem::take(&mut self.pending);
             last_frame.resize(VAD_FRAME_SAMPLES, 0.0);
@@ -119,40 +112,7 @@ impl GateInput {
     }
 
     fn reset(&mut self) {
-        if let Some(resampler) = &self.resampler {
-            resampler.reset();
-        }
-        self.resampler = None;
-        self.input_sample_rate = None;
         self.pending.clear();
-    }
-
-    fn validate_sample_rate(&mut self, sample_rate: i32) -> Result<()> {
-        if sample_rate <= 0 {
-            return Err(AppError::Unavailable(
-                "audio input reported an invalid sample rate".to_owned(),
-            ));
-        }
-        if let Some(previous) = self.input_sample_rate {
-            if previous != sample_rate {
-                return Err(AppError::Unavailable(
-                    "audio input sample rate changed during a dictation".to_owned(),
-                ));
-            }
-            return Ok(());
-        }
-
-        self.input_sample_rate = Some(sample_rate);
-        if sample_rate != VAD_SAMPLE_RATE {
-            self.resampler = Some(
-                LinearResampler::create(sample_rate, VAD_SAMPLE_RATE).ok_or_else(|| {
-                    AppError::Unavailable(format!(
-                        "could not resample audio from {sample_rate} Hz to {VAD_SAMPLE_RATE} Hz"
-                    ))
-                })?,
-            );
-        }
-        Ok(())
     }
 
     fn accept_16khz(&mut self, samples: &[f32]) -> Vec<Vec<f32>> {
@@ -165,7 +125,7 @@ impl GateInput {
     }
 }
 
-/// Silero VAD that gates arbitrary input chunks before a recognizer.
+/// Silero VAD that gates 16 kHz input chunks before a recognizer.
 pub struct SpeechGate {
     detector: VoiceActivityDetector,
     input: GateInput,
@@ -382,15 +342,12 @@ mod tests {
     }
 
     #[test]
-    fn converts_non_16khz_input_to_vad_frames() {
+    fn rejects_non_16khz_input() {
         let mut input = GateInput::new();
-        let mut frames = input
-            .accept_audio(48_000, &vec![0.25; 48_000])
-            .expect("resample input");
-        frames.extend(input.finish_session());
-        let output_samples = frames.len() * VAD_FRAME_SAMPLES;
-        assert!(frames.iter().all(|frame| frame.len() == VAD_FRAME_SAMPLES));
-        assert!((15_360..=16_896).contains(&output_samples));
+        let error = input
+            .accept_audio(48_000, &[0.25; VAD_FRAME_SAMPLES])
+            .expect_err("wrong rate must fail");
+        assert!(error.to_string().contains("requires 16000 Hz"));
     }
 
     #[test]

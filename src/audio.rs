@@ -78,8 +78,10 @@ pub fn read_wav(path: &Path) -> Result<Waveform> {
                 .map(|sample| (*sample as f32 - 128.0) / 128.0)
                 .sum::<f32>(),
             16 => frame
-                .chunks_exact(2)
-                .map(|sample| i16::from_le_bytes([sample[0], sample[1]]) as f32 / i16::MAX as f32)
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|sample| i16::from_le_bytes(*sample) as f32 / i16::MAX as f32)
                 .sum::<f32>(),
             _ => unreachable!("validated PCM bit depth"),
         };

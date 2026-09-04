@@ -1,7 +1,9 @@
 pub mod app;
 pub mod audio;
+pub mod audio_pipeline;
 pub mod config;
 pub mod delivery;
+pub mod dictation_transcript;
 pub mod domain;
 pub mod error;
 pub mod evaluation;

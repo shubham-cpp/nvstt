@@ -8,27 +8,21 @@ use tracing::warn;
 use crate::error::{AppError, Result};
 
 const MAX_CAPTURE_SECONDS: usize = 30 * 60;
-
-/// A mono PCM capture returned when a recording session stops.
-#[derive(Clone, Debug, Default)]
-pub struct RecordedAudio {
-    pub sample_rate: i32,
-    pub samples: Vec<f32>,
-}
+const NOOP_SAMPLE_RATE: i32 = 16_000;
 
 pub trait Recorder: Send {
     fn start(&mut self) -> Result<()>;
-    fn stop(&mut self) -> Result<Option<RecordedAudio>>;
+    /// Stop capturing. The live source stays readable so the worker can drain.
+    fn stop(&mut self) -> Result<()>;
     fn cancel(&mut self) -> Result<()>;
-
-    fn audio_source(&self) -> Option<AudioSource> {
-        None
-    }
+    /// Live PCM source. Valid after `start` until `cancel`.
+    fn audio_source(&self) -> Result<AudioSource>;
 }
 
 #[derive(Debug, Default)]
 pub struct NoopRecorder {
     active: bool,
+    capture: Option<Arc<Mutex<CaptureState>>>,
 }
 
 impl Recorder for NoopRecorder {
@@ -39,20 +33,26 @@ impl Recorder for NoopRecorder {
             ));
         }
         self.active = true;
+        self.capture = Some(Arc::new(Mutex::new(CaptureState::new(NOOP_SAMPLE_RATE, 1))));
         Ok(())
     }
 
-    fn stop(&mut self) -> Result<Option<RecordedAudio>> {
+    fn stop(&mut self) -> Result<()> {
         if !self.active {
             return Err(AppError::InvalidState("recorder is not active".to_owned()));
         }
         self.active = false;
-        Ok(None)
+        Ok(())
     }
 
     fn cancel(&mut self) -> Result<()> {
         self.active = false;
+        self.capture = None;
         Ok(())
+    }
+
+    fn audio_source(&self) -> Result<AudioSource> {
+        live_audio_source(&self.capture)
     }
 }
 
@@ -279,7 +279,7 @@ impl Recorder for CpalRecorder {
         Ok(())
     }
 
-    fn stop(&mut self) -> Result<Option<RecordedAudio>> {
+    fn stop(&mut self) -> Result<()> {
         let Some(stream) = self.stream.take() else {
             return Err(AppError::InvalidState("recorder is not active".to_owned()));
         };
@@ -291,7 +291,7 @@ impl Recorder for CpalRecorder {
         {
             warn!(error = %error, "audio input stream reported an error");
         }
-        Ok(None)
+        Ok(())
     }
 
     fn cancel(&mut self) -> Result<()> {
@@ -301,11 +301,18 @@ impl Recorder for CpalRecorder {
         Ok(())
     }
 
-    fn audio_source(&self) -> Option<AudioSource> {
-        self.capture.as_ref().map(|capture| AudioSource {
+    fn audio_source(&self) -> Result<AudioSource> {
+        live_audio_source(&self.capture)
+    }
+}
+
+fn live_audio_source(capture: &Option<Arc<Mutex<CaptureState>>>) -> Result<AudioSource> {
+    capture
+        .as_ref()
+        .map(|capture| AudioSource {
             capture: Arc::clone(capture),
         })
-    }
+        .ok_or_else(|| AppError::InvalidState("recorder is not active".to_owned()))
 }
 
 fn append_interleaved<T>(data: &[T], capture: &Arc<Mutex<CaptureState>>)
@@ -334,6 +341,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn noop_recorder_exposes_a_live_source_after_start() {
+        let mut recorder = NoopRecorder::default();
+        assert!(recorder.audio_source().is_err());
+        recorder.start().expect("start noop recorder");
+        let source = recorder.audio_source().expect("live source");
+        assert_eq!(source.sample_rate(), NOOP_SAMPLE_RATE);
+        recorder.stop().expect("stop noop recorder");
+        assert!(source.drain().expect("drain").is_empty());
+    }
 
     #[test]
     fn downmixes_interleaved_samples() {

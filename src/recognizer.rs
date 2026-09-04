@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use sherpa_onnx::{LinearResampler, OnlineRecognizer, OnlineRecognizerConfig, OnlineStream};
+use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig, OnlineStream};
 
 use crate::{
-    config::{Config, PARAKEET_UNIFIED_MODEL, RecognizerFamily},
+    audio_pipeline::MODEL_SAMPLE_RATE,
+    config::{Config, RecognizerFamily},
     error::{AppError, Result},
     speech_gate::{SpeechGate, VAD_SAMPLE_RATE},
 };
@@ -105,7 +106,6 @@ impl StreamingRecognizer for StaticRecognizer {
     }
 }
 
-const MODEL_SAMPLE_RATE: i32 = 16_000;
 const DEFAULT_NUM_THREADS: i32 = 8;
 
 #[cfg(all(feature = "cpu-runtime", feature = "cuda-runtime"))]
@@ -132,8 +132,6 @@ pub fn execution_provider() -> &'static str {
 pub struct OnlineTransducerRecognizer {
     recognizer: OnlineRecognizer,
     stream: Option<OnlineStream>,
-    resampler: Option<LinearResampler>,
-    input_sample_rate: Option<i32>,
 }
 
 impl OnlineTransducerRecognizer {
@@ -174,8 +172,6 @@ impl OnlineTransducerRecognizer {
         Ok(Self {
             recognizer,
             stream: None,
-            resampler: None,
-            input_sample_rate: None,
         })
     }
 
@@ -190,13 +186,6 @@ impl OnlineTransducerRecognizer {
             self.recognizer.decode(stream);
         }
     }
-
-    fn flush_resampler(&self) {
-        if let (Some(resampler), Some(_)) = (&self.resampler, &self.stream) {
-            let samples = resampler.resample(&[], true);
-            self.feed_model(&samples, MODEL_SAMPLE_RATE);
-        }
-    }
 }
 
 impl StreamingRecognizer for OnlineTransducerRecognizer {
@@ -207,8 +196,6 @@ impl StreamingRecognizer for OnlineTransducerRecognizer {
             ));
         }
         self.stream = Some(self.recognizer.create_stream());
-        self.resampler = None;
-        self.input_sample_rate = None;
         Ok(())
     }
 
@@ -218,34 +205,12 @@ impl StreamingRecognizer for OnlineTransducerRecognizer {
                 "recognizer session is not active".to_owned(),
             ));
         }
-        if sample_rate <= 0 {
-            return Err(AppError::Unavailable(
-                "audio input reported an invalid sample rate".to_owned(),
-            ));
+        if sample_rate != MODEL_SAMPLE_RATE {
+            return Err(AppError::Unavailable(format!(
+                "recognizer requires {MODEL_SAMPLE_RATE} Hz audio, got {sample_rate} Hz"
+            )));
         }
-        if let Some(previous) = self.input_sample_rate {
-            if previous != sample_rate {
-                return Err(AppError::Unavailable(
-                    "audio input sample rate changed during a dictation".to_owned(),
-                ));
-            }
-        } else {
-            self.input_sample_rate = Some(sample_rate);
-            if sample_rate != MODEL_SAMPLE_RATE {
-                self.resampler = Some(LinearResampler::create(sample_rate, MODEL_SAMPLE_RATE).ok_or_else(|| {
-                    AppError::Unavailable(format!(
-                        "could not resample audio from {sample_rate} Hz to {MODEL_SAMPLE_RATE} Hz"
-                    ))
-                })?);
-            }
-        }
-
-        if let Some(resampler) = &self.resampler {
-            let resampled = resampler.resample(samples, false);
-            self.feed_model(&resampled, MODEL_SAMPLE_RATE);
-        } else {
-            self.feed_model(samples, sample_rate);
-        }
+        self.feed_model(samples, sample_rate);
         Ok(())
     }
 
@@ -255,7 +220,6 @@ impl StreamingRecognizer for OnlineTransducerRecognizer {
                 "recognizer session is not active".to_owned(),
             ));
         };
-        self.flush_resampler();
         stream.input_finished();
         while self.recognizer.is_ready(stream) {
             self.recognizer.decode(stream);
@@ -266,46 +230,12 @@ impl StreamingRecognizer for OnlineTransducerRecognizer {
             .map(|result| result.text)
             .unwrap_or_default();
         self.stream = None;
-        self.resampler = None;
-        self.input_sample_rate = None;
         Ok(RecognitionOutcome::Transcript(transcript))
     }
 
     fn cancel_session(&mut self) -> Result<()> {
         self.stream = None;
-        self.resampler = None;
-        self.input_sample_rate = None;
         Ok(())
-    }
-}
-
-/// Compatibility facade for direct Parakeet benchmarks and local rollback.
-pub struct ParakeetRecognizer(OnlineTransducerRecognizer);
-
-impl ParakeetRecognizer {
-    pub fn from_model_dir(model_dir: impl Into<PathBuf>) -> Result<Self> {
-        Ok(Self(OnlineTransducerRecognizer::from_model_dir(
-            model_dir,
-            PARAKEET_UNIFIED_MODEL,
-        )?))
-    }
-}
-
-impl StreamingRecognizer for ParakeetRecognizer {
-    fn start_session(&mut self) -> Result<()> {
-        self.0.start_session()
-    }
-
-    fn accept_audio(&mut self, sample_rate: i32, samples: &[f32]) -> Result<()> {
-        self.0.accept_audio(sample_rate, samples)
-    }
-
-    fn finish_session(&mut self) -> Result<RecognitionOutcome> {
-        self.0.finish_session()
-    }
-
-    fn cancel_session(&mut self) -> Result<()> {
-        self.0.cancel_session()
     }
 }
 

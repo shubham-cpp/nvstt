@@ -15,10 +15,12 @@ use std::{
 };
 
 use nvstt::audio::{Waveform as Wav, read_wav};
+use nvstt::audio_pipeline::{AudioPipeline, MODEL_SAMPLE_RATE};
+use nvstt::config::PARAKEET_UNIFIED_MODEL;
 use nvstt::recognizer::StreamingRecognizer;
 use nvstt::{
     error::Result,
-    recognizer::{ParakeetRecognizer, RecognitionOutcome},
+    recognizer::{OnlineTransducerRecognizer, RecognitionOutcome},
 };
 use serde::Serialize;
 
@@ -47,16 +49,26 @@ fn main() -> Result<()> {
         wav.samples.truncate(benchmark_samples);
 
         let model_load_started = Instant::now();
-        let mut recognizer = ParakeetRecognizer::from_model_dir(model_dir)?;
+        let mut recognizer =
+            OnlineTransducerRecognizer::from_model_dir(model_dir, PARAKEET_UNIFIED_MODEL)?;
         let model_load = model_load_started.elapsed();
         return run_benchmark(&mut recognizer, &wav, iterations, model_load);
     }
 
-    let mut recognizer = ParakeetRecognizer::from_model_dir(model_dir)?;
+    let mut recognizer =
+        OnlineTransducerRecognizer::from_model_dir(model_dir, PARAKEET_UNIFIED_MODEL)?;
     recognizer.start_session()?;
+    let mut audio_pipeline = AudioPipeline::new(false);
 
     for chunk in wav.samples.chunks((wav.sample_rate as usize / 10).max(1)) {
-        recognizer.accept_audio(wav.sample_rate, chunk)?;
+        let converted = audio_pipeline.accept_audio(wav.sample_rate, chunk)?;
+        if !converted.is_empty() {
+            recognizer.accept_audio(MODEL_SAMPLE_RATE, &converted)?;
+        }
+    }
+    let converted = audio_pipeline.finish()?;
+    if !converted.is_empty() {
+        recognizer.accept_audio(MODEL_SAMPLE_RATE, &converted)?;
     }
     match recognizer.finish_session()? {
         RecognitionOutcome::Transcript(transcript) => println!("{transcript}"),
@@ -83,36 +95,11 @@ fn parse_args() -> Result<Arguments> {
         if arg == "--model-dir" {
             model_dir = args.next().map(PathBuf::from);
         } else if arg == "--seconds" {
-            let value = args.next().ok_or_else(|| {
-                nvstt::error::AppError::Config("--seconds requires a positive integer".to_owned())
-            })?;
-            max_seconds = Some(value.to_string_lossy().parse::<usize>().map_err(|_| {
-                nvstt::error::AppError::Config("--seconds requires a positive integer".to_owned())
-            })?);
-            if max_seconds == Some(0) {
-                return Err(nvstt::error::AppError::Config(
-                    "--seconds requires a positive integer".to_owned(),
-                ));
-            }
+            max_seconds = Some(parse_positive_usize(&mut args, "--seconds")?);
         } else if arg == "--benchmark" {
             benchmark = true;
         } else if arg == "--iterations" {
-            let value = args.next().ok_or_else(|| {
-                nvstt::error::AppError::Config(
-                    "--iterations requires a positive integer".to_owned(),
-                )
-            })?;
-            let iterations = value.to_string_lossy().parse::<usize>().map_err(|_| {
-                nvstt::error::AppError::Config(
-                    "--iterations requires a positive integer".to_owned(),
-                )
-            })?;
-            if iterations == 0 {
-                return Err(nvstt::error::AppError::Config(
-                    "--iterations requires a positive integer".to_owned(),
-                ));
-            }
-            benchmark_iterations = Some(iterations);
+            benchmark_iterations = Some(parse_positive_usize(&mut args, "--iterations")?);
         } else if wav_path.is_none() {
             wav_path = Some(PathBuf::from(arg));
         } else {
@@ -145,6 +132,24 @@ fn parse_args() -> Result<Arguments> {
     })
 }
 
+fn parse_positive_usize(
+    args: &mut impl Iterator<Item = std::ffi::OsString>,
+    flag: &str,
+) -> Result<usize> {
+    let value = args.next().ok_or_else(|| {
+        nvstt::error::AppError::Config(format!("{flag} requires a positive integer"))
+    })?;
+    let parsed = value.to_string_lossy().parse::<usize>().map_err(|_| {
+        nvstt::error::AppError::Config(format!("{flag} requires a positive integer"))
+    })?;
+    if parsed == 0 {
+        return Err(nvstt::error::AppError::Config(format!(
+            "{flag} requires a positive integer"
+        )));
+    }
+    Ok(parsed)
+}
+
 #[derive(Serialize)]
 struct BenchmarkRun {
     stream_processing_ms: u64,
@@ -168,7 +173,7 @@ struct BenchmarkReport {
 }
 
 fn run_benchmark(
-    recognizer: &mut ParakeetRecognizer,
+    recognizer: &mut OnlineTransducerRecognizer,
     wav: &Wav,
     iterations: usize,
     model_load: Duration,
@@ -210,8 +215,12 @@ fn run_benchmark(
     }
 }
 
-fn measure_benchmark_run(recognizer: &mut ParakeetRecognizer, wav: &Wav) -> Result<BenchmarkRun> {
+fn measure_benchmark_run(
+    recognizer: &mut OnlineTransducerRecognizer,
+    wav: &Wav,
+) -> Result<BenchmarkRun> {
     recognizer.start_session()?;
+    let mut audio_pipeline = AudioPipeline::new(false);
 
     let chunk_samples = ((wav.sample_rate as usize * BENCHMARK_CHUNK_MS as usize) / 1_000).max(1);
     let mut samples_before = 0usize;
@@ -221,7 +230,10 @@ fn measure_benchmark_run(recognizer: &mut ParakeetRecognizer, wav: &Wav) -> Resu
     for chunk in wav.samples.chunks(chunk_samples) {
         let arrival_at = audio_duration(samples_before, wav.sample_rate);
         let processing_started = Instant::now();
-        recognizer.accept_audio(wav.sample_rate, chunk)?;
+        let converted = audio_pipeline.accept_audio(wav.sample_rate, chunk)?;
+        if !converted.is_empty() {
+            recognizer.accept_audio(MODEL_SAMPLE_RATE, &converted)?;
+        }
         let processing_time = processing_started.elapsed();
         stream_processing += processing_time;
         worker_ready_at = worker_ready_at.max(arrival_at) + processing_time;
@@ -231,6 +243,10 @@ fn measure_benchmark_run(recognizer: &mut ParakeetRecognizer, wav: &Wav) -> Resu
     let stop_at = audio_duration(wav.samples.len(), wav.sample_rate);
     let predicted_pre_stop_backlog = worker_ready_at.saturating_sub(stop_at);
     let finalization_started = Instant::now();
+    let converted = audio_pipeline.finish()?;
+    if !converted.is_empty() {
+        recognizer.accept_audio(MODEL_SAMPLE_RATE, &converted)?;
+    }
     let _ = recognizer.finish_session()?;
     let model_finalization = finalization_started.elapsed();
 
