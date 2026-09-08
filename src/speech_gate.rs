@@ -37,7 +37,7 @@ impl GateState {
     fn accept_frame(&mut self, frame: &[f32], detected: bool) -> Vec<f32> {
         self.push_pre_roll(frame);
 
-        match (self.active, detected) {
+        let output = match (self.active, detected) {
             (false, false) => Vec::new(),
             (false, true) => {
                 let mut output = Vec::with_capacity(
@@ -63,7 +63,11 @@ impl GateState {
                 self.active = false;
                 frame.to_vec()
             }
+        };
+        if !output.is_empty() {
+            self.pre_roll.clear();
         }
+        output
     }
 
     fn push_pre_roll(&mut self, samples: &[f32]) {
@@ -303,11 +307,45 @@ mod tests {
         state.accept_frame(&speech, true);
         state.accept_frame(&silence, false);
         let output = state.accept_frame(&speech, true);
-        assert!(
-            output[..SILENCE_BRIDGE_SAMPLES]
-                .iter()
-                .all(|sample| *sample == 0.0)
-        );
+        let expected = [vec![0.0; SILENCE_BRIDGE_SAMPLES], speech].concat();
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn restart_never_replays_emitted_frames() {
+        let mut state = GateState::default();
+        let first = frame(1.0);
+        let boundary = frame(2.0);
+        let second = frame(3.0);
+        assert_eq!(state.accept_frame(&first, true), first);
+        assert_eq!(state.accept_frame(&boundary, false), boundary);
+        let output = state.accept_frame(&second, true);
+        let expected = [vec![0.0; SILENCE_BRIDGE_SAMPLES], second].concat();
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn repeated_transitions_preserve_only_unemitted_preroll() {
+        let mut state = GateState::default();
+        let mut nonzero = Vec::new();
+        for (value, detected) in [
+            (1.0, true),
+            (2.0, false),
+            (3.0, false),
+            (4.0, true),
+            (5.0, false),
+            (6.0, true),
+        ] {
+            nonzero.extend(
+                state.accept_frame(&frame(value), detected)
+                    .into_iter()
+                    .filter(|sample| *sample != 0.0),
+            );
+        }
+        let expected = (1..=6)
+            .flat_map(|value| frame(value as f32))
+            .collect::<Vec<_>>();
+        assert_eq!(nonzero, expected);
     }
 
     #[test]
