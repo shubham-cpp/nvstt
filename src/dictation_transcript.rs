@@ -2,7 +2,7 @@
 //!
 //! This is linguistic cleanup of a transcript. It is not the speech gate.
 //! The speech gate routes audio. This module decides whether finished
-//! recognition has text worth keeping.
+//! recognition has text worth keeping. Ambiguous tokens remain.
 //!
 //! Order: collapse short stutters, strip filled pauses, apply user
 //! replacements, then optionally normalize spoken forms.
@@ -14,9 +14,7 @@ use crate::recognizer::RecognitionOutcome;
 
 /// Spoken hesitation words the English models often emit as tokens.
 /// Match whole tokens only. Do not treat these as prefixes.
-const FILLED_PAUSES: &[&str] = &[
-    "uh", "uhh", "uhhh", "um", "umm", "ummm", "er", "erm", "hmm", "hm", "mm", "mmm",
-];
+const FILLED_PAUSES: &[&str] = &["uh", "uhh", "uhhh", "um", "umm", "ummm"];
 
 /// Consecutive copies of a 1 or 2 letter token that the recognizer looped.
 const STUTTER_RUN: usize = 3;
@@ -132,7 +130,7 @@ pub fn dictation_transcript(
     let collapsed = collapse_stutters(&tokens);
     let without_fillers: Vec<&str> = collapsed
         .into_iter()
-        .filter(|token| !is_filled_pause(token) && !word_core(token).is_empty())
+        .filter(|token| !is_filled_pause(token))
         .collect();
     let replaced = apply_replacements(&without_fillers, replacements).join(" ");
     let cleaned = if itn {
@@ -158,6 +156,7 @@ fn collapse_stutters<'a>(tokens: &[&'a str]) -> Vec<&'a str> {
         if is_short_stutter_token(core) {
             let mut run = 1;
             while index + run < tokens.len()
+                && is_short_stutter_token(word_core(tokens[index + run]))
                 && word_core(tokens[index + run]).eq_ignore_ascii_case(core)
             {
                 run += 1;
@@ -175,9 +174,9 @@ fn collapse_stutters<'a>(tokens: &[&'a str]) -> Vec<&'a str> {
 }
 
 fn is_short_stutter_token(core: &str) -> bool {
-    let letters = core.len();
-    (1..=STUTTER_MAX_LETTERS).contains(&letters)
+    (1..=STUTTER_MAX_LETTERS).contains(&core.len())
         && core.bytes().all(|byte| byte.is_ascii_alphabetic())
+        && !(core.len() >= 2 && core.bytes().all(|byte| byte.is_ascii_uppercase()))
 }
 
 fn apply_replacements(tokens: &[&str], replacements: &Replacements) -> Vec<String> {
@@ -199,17 +198,48 @@ fn apply_replacements(tokens: &[&str], replacements: &Replacements) -> Vec<Strin
 
 fn is_filled_pause(token: &str) -> bool {
     let core = word_core(token);
-    FILLED_PAUSES
-        .iter()
-        .any(|filler| core.eq_ignore_ascii_case(filler))
+    let lowercase = core.bytes().all(|b| b.is_ascii_lowercase());
+    let title_case = core.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+        && core.as_bytes()[1..].iter().all(u8::is_ascii_lowercase);
+    (lowercase || title_case)
+        && FILLED_PAUSES.iter().any(|filler| core.eq_ignore_ascii_case(filler))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TokenParts<'a> {
+    leading: &'a str,
+    core: &'a str,
+    trailing: &'a str,
+}
+
+fn token_parts(token: &str) -> TokenParts<'_> {
+    let rest = token.trim_start_matches(|c: char| {
+        matches!(c, '"' | '\'' | '“' | '‘' | '(' | '[' | '{')
+    });
+    let core = rest.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '"' | '\'' | '”' | '’' | ')' | ']' | '}' | ',' | '.' | '!' | '?' | ';' | ':'
+        )
+    });
+    if core.is_empty() {
+        return TokenParts {
+            leading: "",
+            core: token,
+            trailing: "",
+        };
+    }
+    let start = token.len() - rest.len();
+    let end = start + core.len();
+    TokenParts {
+        leading: &token[..start],
+        core,
+        trailing: &token[end..],
+    }
 }
 
 fn word_core(token: &str) -> &str {
-    token.trim_matches(|character: char| !is_word_char(character))
-}
-
-fn is_word_char(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '\'' | '-' | '\u{2019}')
+    token_parts(token).core
 }
 
 #[cfg(test)]
@@ -234,6 +264,42 @@ mod tests {
                 .map(|(pattern, replacement)| ((*pattern).to_owned(), (*replacement).to_owned())),
         );
         dictation_transcript(transcript(text), &replacements, false)
+    }
+
+    #[test]
+    fn technical_tokens_survive_cleanup_with_and_without_itn() {
+        for itn in [false, true] {
+            for text in [
+                "5 mm", "ER diagram", "a + b = c", "C++ C# .env config.rs",
+                "ER ER ER", "C C++ C", "very very", "UH UM",
+            ] {
+                assert_eq!(
+                    dictation_transcript(transcript(text), &Replacements::default(), itn),
+                    Ok(DictationTranscript::Ready(text.to_owned())),
+                    "input={text:?}, itn={itn}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn punctuation_only_input_is_not_silently_discarded() {
+        assert_eq!(
+            clean("+ = /"),
+            Ok(DictationTranscript::Ready("+ = /".to_owned()))
+        );
+    }
+
+    #[test]
+    fn uppercase_token_interrupts_a_stutter_run() {
+        assert_eq!(
+            clean("no NO no"),
+            Ok(DictationTranscript::Ready("no NO no".to_owned()))
+        );
+        assert_eq!(
+            clean("er ER er"),
+            Ok(DictationTranscript::Ready("er ER er".to_owned()))
+        );
     }
 
     #[test]
@@ -305,9 +371,13 @@ mod tests {
     }
 
     #[test]
-    fn match_is_case_insensitive() {
+    fn uppercase_acronyms_are_not_fillers() {
         assert_eq!(
             clean("UH Hello UM"),
+            Ok(DictationTranscript::Ready("UH Hello UM".to_owned()))
+        );
+        assert_eq!(
+            clean("uh Hello Um"),
             Ok(DictationTranscript::Ready("Hello".to_owned()))
         );
     }
