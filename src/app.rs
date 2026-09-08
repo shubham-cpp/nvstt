@@ -111,7 +111,7 @@ impl RecognitionWorker {
 
 fn run_recognition_worker(
     mut recognizer: Box<dyn StreamingRecognizer>,
-    source: AudioSource,
+    mut source: AudioSource,
     denoise: bool,
     command_rx: Receiver<WorkerCommand>,
     completion_tx: Sender<WorkerCompletion>,
@@ -120,7 +120,7 @@ fn run_recognition_worker(
     let mut worker_error: Option<AppError> = None;
     let outcome = loop {
         feed_audio_if_healthy(
-            &source,
+            &mut source,
             recognizer.as_mut(),
             &mut audio_pipeline,
             &mut worker_error,
@@ -129,7 +129,7 @@ fn run_recognition_worker(
         match command_rx.recv_timeout(Duration::from_millis(20)) {
             Ok(WorkerCommand::Finish) => {
                 finish_audio_if_healthy(
-                    &source,
+                    &mut source,
                     recognizer.as_mut(),
                     &mut audio_pipeline,
                     &mut worker_error,
@@ -159,7 +159,7 @@ fn run_recognition_worker(
 }
 
 fn feed_audio_if_healthy(
-    source: &AudioSource,
+    source: &mut AudioSource,
     recognizer: &mut dyn StreamingRecognizer,
     audio_pipeline: &mut AudioPipeline,
     worker_error: &mut Option<AppError>,
@@ -170,7 +170,7 @@ fn feed_audio_if_healthy(
 }
 
 fn finish_audio_if_healthy(
-    source: &AudioSource,
+    source: &mut AudioSource,
     recognizer: &mut dyn StreamingRecognizer,
     audio_pipeline: &mut AudioPipeline,
     worker_error: &mut Option<AppError>,
@@ -181,7 +181,7 @@ fn finish_audio_if_healthy(
 }
 
 fn feed_available_audio(
-    source: &AudioSource,
+    source: &mut AudioSource,
     recognizer: &mut dyn StreamingRecognizer,
     audio_pipeline: &mut AudioPipeline,
 ) -> Result<()> {
@@ -193,7 +193,7 @@ fn feed_available_audio(
 }
 
 fn drain_audio(
-    source: &AudioSource,
+    source: &mut AudioSource,
     recognizer: &mut dyn StreamingRecognizer,
     audio_pipeline: &mut AudioPipeline,
 ) -> Result<()> {
@@ -207,7 +207,7 @@ fn drain_audio(
 }
 
 fn finish_audio(
-    source: &AudioSource,
+    source: &mut AudioSource,
     recognizer: &mut dyn StreamingRecognizer,
     audio_pipeline: &mut AudioPipeline,
 ) -> Result<()> {
@@ -216,11 +216,7 @@ fn finish_audio(
     if !samples.is_empty() {
         recognizer.accept_audio(MODEL_SAMPLE_RATE, &samples)?;
     }
-    if source.overflowed()? {
-        return Err(AppError::Unavailable(
-            "audio capture exceeded the 30 minute limit".to_owned(),
-        ));
-    }
+    source.integrity_result()?;
     Ok(())
 }
 

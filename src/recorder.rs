@@ -1,12 +1,14 @@
-use std::collections::VecDeque;
+use std::fmt::Display;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat, Stream, StreamConfig};
-use tracing::warn;
+use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::error::{AppError, Result};
 
+const CAPTURE_QUEUE_SECONDS: usize = 5;
 const MAX_CAPTURE_SECONDS: usize = 30 * 60;
 const NOOP_SAMPLE_RATE: i32 = 16_000;
 
@@ -15,14 +17,16 @@ pub trait Recorder: Send {
     /// Stop capturing. The live source stays readable so the worker can drain.
     fn stop(&mut self) -> Result<()>;
     fn cancel(&mut self) -> Result<()>;
-    /// Live PCM source. Valid after `start` until `cancel`.
-    fn audio_source(&self) -> Result<AudioSource>;
+    /// Take the sole PCM consumer for this capture session.
+    fn audio_source(&mut self) -> Result<AudioSource>;
 }
 
 #[derive(Debug, Default)]
 pub struct NoopRecorder {
     active: bool,
-    capture: Option<Arc<Mutex<CaptureState>>>,
+    writer: Option<CaptureWriter>,
+    source: Option<AudioSource>,
+    integrity: Option<Arc<CaptureIntegrity>>,
 }
 
 impl Recorder for NoopRecorder {
@@ -32,8 +36,16 @@ impl Recorder for NoopRecorder {
                 "recorder is already active".to_owned(),
             ));
         }
+        let (writer, source) = capture_pair(
+            NOOP_SAMPLE_RATE,
+            1,
+            NOOP_SAMPLE_RATE as usize * CAPTURE_QUEUE_SECONDS,
+            NOOP_SAMPLE_RATE as usize * MAX_CAPTURE_SECONDS,
+        );
+        self.integrity = Some(Arc::clone(&source.integrity));
+        self.writer = Some(writer);
+        self.source = Some(source);
         self.active = true;
-        self.capture = Some(Arc::new(Mutex::new(CaptureState::new(NOOP_SAMPLE_RATE, 1))));
         Ok(())
     }
 
@@ -42,83 +54,168 @@ impl Recorder for NoopRecorder {
             return Err(AppError::InvalidState("recorder is not active".to_owned()));
         }
         self.active = false;
-        Ok(())
+        self.writer.take();
+        self.integrity
+            .as_ref()
+            .expect("active capture integrity")
+            .result()
     }
 
     fn cancel(&mut self) -> Result<()> {
+        self.writer.take();
+        self.source.take();
+        self.integrity.take();
         self.active = false;
-        self.capture = None;
         Ok(())
     }
 
-    fn audio_source(&self) -> Result<AudioSource> {
-        live_audio_source(&self.capture)
+    fn audio_source(&mut self) -> Result<AudioSource> {
+        take_audio_source(&mut self.source)
+    }
+}
+
+#[derive(Debug, Default)]
+struct CaptureIntegrity {
+    dropped_samples: AtomicUsize,
+    duration_exceeded: AtomicBool,
+    backend_failed: AtomicBool,
+    backend_message: Mutex<Option<String>>,
+}
+
+impl CaptureIntegrity {
+    fn record_backend_error(&self, error: &impl Display) {
+        self.backend_failed.store(true, Ordering::SeqCst);
+        if let Ok(mut message) = self.backend_message.try_lock() {
+            *message = Some(error.to_string());
+        }
+    }
+
+    fn result(&self) -> Result<()> {
+        let mut reasons = Vec::new();
+        let dropped = self.dropped_samples.load(Ordering::SeqCst);
+        if dropped != 0 {
+            reasons.push(format!("{dropped} mono samples dropped by the capture queue"));
+        }
+        if self.backend_failed.load(Ordering::SeqCst) {
+            let detail = self
+                .backend_message
+                .try_lock()
+                .ok()
+                .and_then(|message| message.clone());
+            reasons.push(match detail {
+                Some(detail) => format!("backend capture error: {detail}"),
+                None => "backend capture error".to_owned(),
+            });
+        }
+        if self.duration_exceeded.load(Ordering::SeqCst) {
+            reasons.push("audio capture exceeded the 30 minute limit".to_owned());
+        }
+        if reasons.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::Unavailable(format!(
+                "audio capture integrity failure: {}",
+                reasons.join("; ")
+            )))
+        }
     }
 }
 
 #[derive(Debug)]
-struct CaptureState {
-    sample_rate: i32,
+struct CaptureWriter {
+    producer: Producer<f32>,
+    integrity: Arc<CaptureIntegrity>,
     channels: usize,
-    samples: VecDeque<f32>,
     total_samples: usize,
-    overflowed: bool,
+    max_samples: usize,
 }
 
-impl CaptureState {
-    fn new(sample_rate: i32, channels: usize) -> Self {
-        Self {
-            sample_rate,
-            channels,
-            samples: VecDeque::new(),
-            total_samples: 0,
-            overflowed: false,
+impl CaptureWriter {
+    fn accept_interleaved<T>(&mut self, data: &[T])
+    where
+        T: Sample,
+        f32: cpal::FromSample<T>,
+    {
+        for frame in data.chunks(self.channels) {
+            let beyond_limit = self.total_samples >= self.max_samples;
+            self.total_samples = self.total_samples.saturating_add(1);
+            if beyond_limit {
+                self.integrity.duration_exceeded.store(true, Ordering::SeqCst);
+                continue;
+            }
+            let sum = frame
+                .iter()
+                .map(|sample| f32::from_sample(*sample))
+                .sum::<f32>();
+            if self.producer.push(sum / frame.len() as f32).is_err() {
+                self.integrity.dropped_samples.fetch_add(1, Ordering::SeqCst);
+            }
         }
     }
 }
 
 /// A live mono PCM source consumed by the recognition worker.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AudioSource {
-    capture: Arc<Mutex<CaptureState>>,
+    consumer: Consumer<f32>,
+    sample_rate: i32,
+    integrity: Arc<CaptureIntegrity>,
+}
+
+fn capture_pair(
+    sample_rate: i32,
+    channels: usize,
+    capacity: usize,
+    max_samples: usize,
+) -> (CaptureWriter, AudioSource) {
+    let (producer, consumer) = RingBuffer::new(capacity);
+    let integrity = Arc::new(CaptureIntegrity::default());
+    (
+        CaptureWriter {
+            producer,
+            integrity: Arc::clone(&integrity),
+            channels,
+            total_samples: 0,
+            max_samples,
+        },
+        AudioSource {
+            consumer,
+            sample_rate,
+            integrity,
+        },
+    )
 }
 
 impl AudioSource {
     pub(crate) fn sample_rate(&self) -> i32 {
-        self.capture
-            .lock()
-            .map(|state| state.sample_rate)
-            .unwrap_or_default()
+        self.sample_rate
     }
 
-    pub(crate) fn drain(&self) -> Result<Vec<f32>> {
-        let mut state = self
-            .capture
-            .lock()
-            .map_err(|_| AppError::Unavailable("audio capture lock was poisoned".to_owned()))?;
-        Ok(state.samples.drain(..).collect())
+    pub(crate) fn drain(&mut self) -> Result<Vec<f32>> {
+        let available = self.consumer.slots();
+        self.drain_snapshot(available)
     }
 
-    pub(crate) fn overflowed(&self) -> Result<bool> {
-        let state = self
-            .capture
-            .lock()
-            .map_err(|_| AppError::Unavailable("audio capture lock was poisoned".to_owned()))?;
-        Ok(state.overflowed)
+    fn drain_snapshot(&mut self, available: usize) -> Result<Vec<f32>> {
+        let mut samples = Vec::with_capacity(available);
+        for _ in 0..available {
+            samples.push(self.consumer.pop().map_err(|_| {
+                AppError::Unavailable("capture queue snapshot became unreadable".to_owned())
+            })?);
+        }
+        Ok(samples)
+    }
+
+    pub(crate) fn integrity_result(&self) -> Result<()> {
+        self.integrity.result()
     }
 
     #[cfg(test)]
     pub(crate) fn test_source(sample_rate: i32, samples: Vec<f32>) -> Self {
-        let total_samples = samples.len();
-        Self {
-            capture: Arc::new(Mutex::new(CaptureState {
-                sample_rate,
-                channels: 1,
-                samples: samples.into(),
-                total_samples,
-                overflowed: false,
-            })),
-        }
+        let (mut writer, source) =
+            capture_pair(sample_rate, 1, samples.len().max(1), usize::MAX);
+        writer.accept_interleaved(&samples);
+        source
     }
 }
 
@@ -129,28 +226,26 @@ impl AudioSource {
 #[derive(Default)]
 pub struct CpalRecorder {
     stream: Option<Stream>,
-    capture: Option<Arc<Mutex<CaptureState>>>,
-    stream_error: Option<Arc<Mutex<Option<String>>>>,
+    source: Option<AudioSource>,
+    integrity: Option<Arc<CaptureIntegrity>>,
 }
 
 impl CpalRecorder {
     fn build_stream<T>(
         device: &cpal::Device,
         config: StreamConfig,
-        capture: Arc<Mutex<CaptureState>>,
-        stream_error: Arc<Mutex<Option<String>>>,
+        mut writer: CaptureWriter,
     ) -> std::result::Result<Stream, String>
     where
         T: cpal::SizedSample,
         f32: cpal::FromSample<T>,
     {
+        let integrity = Arc::clone(&writer.integrity);
         let error_callback = move |error: cpal::Error| {
-            if let Ok(mut slot) = stream_error.lock() {
-                *slot = Some(error.to_string());
-            }
+            integrity.record_backend_error(&error);
         };
         let data_callback = move |data: &[T], _info: &cpal::InputCallbackInfo| {
-            append_interleaved(data, &capture);
+            writer.accept_interleaved(data);
         };
         device
             .build_input_stream(config, data_callback, error_callback, None)
@@ -183,83 +278,28 @@ impl Recorder for CpalRecorder {
             ));
         }
 
-        let capture = Arc::new(Mutex::new(CaptureState::new(sample_rate, channels)));
-        let stream_error = Arc::new(Mutex::new(None));
+        let (writer, source) = capture_pair(
+            sample_rate,
+            channels,
+            sample_rate as usize * CAPTURE_QUEUE_SECONDS,
+            sample_rate as usize * MAX_CAPTURE_SECONDS,
+        );
+        let integrity = Arc::clone(&source.integrity);
         let sample_format = supported.sample_format();
         let config: StreamConfig = supported.into();
         let stream = match sample_format {
-            SampleFormat::F32 => Self::build_stream::<f32>(
-                &device,
-                config,
-                Arc::clone(&capture),
-                Arc::clone(&stream_error),
-            ),
-            SampleFormat::I8 => Self::build_stream::<i8>(
-                &device,
-                config,
-                Arc::clone(&capture),
-                Arc::clone(&stream_error),
-            ),
-            SampleFormat::I16 => Self::build_stream::<i16>(
-                &device,
-                config,
-                Arc::clone(&capture),
-                Arc::clone(&stream_error),
-            ),
-            SampleFormat::I24 => Self::build_stream::<cpal::I24>(
-                &device,
-                config,
-                Arc::clone(&capture),
-                Arc::clone(&stream_error),
-            ),
-            SampleFormat::I32 => Self::build_stream::<i32>(
-                &device,
-                config,
-                Arc::clone(&capture),
-                Arc::clone(&stream_error),
-            ),
-            SampleFormat::I64 => Self::build_stream::<i64>(
-                &device,
-                config,
-                Arc::clone(&capture),
-                Arc::clone(&stream_error),
-            ),
-            SampleFormat::U8 => Self::build_stream::<u8>(
-                &device,
-                config,
-                Arc::clone(&capture),
-                Arc::clone(&stream_error),
-            ),
-            SampleFormat::U16 => Self::build_stream::<u16>(
-                &device,
-                config,
-                Arc::clone(&capture),
-                Arc::clone(&stream_error),
-            ),
-            SampleFormat::U24 => Self::build_stream::<cpal::U24>(
-                &device,
-                config,
-                Arc::clone(&capture),
-                Arc::clone(&stream_error),
-            ),
-            SampleFormat::U32 => Self::build_stream::<u32>(
-                &device,
-                config,
-                Arc::clone(&capture),
-                Arc::clone(&stream_error),
-            ),
-            SampleFormat::U64 => Self::build_stream::<u64>(
-                &device,
-                config,
-                Arc::clone(&capture),
-                Arc::clone(&stream_error),
-            ),
-            SampleFormat::F64 => Self::build_stream::<f64>(
-                &device,
-                config,
-                Arc::clone(&capture),
-                Arc::clone(&stream_error),
-            ),
+            SampleFormat::F32 => Self::build_stream::<f32>(&device, config, writer),
+            SampleFormat::I8 => Self::build_stream::<i8>(&device, config, writer),
+            SampleFormat::I16 => Self::build_stream::<i16>(&device, config, writer),
+            SampleFormat::I24 => Self::build_stream::<cpal::I24>(&device, config, writer),
+            SampleFormat::I32 => Self::build_stream::<i32>(&device, config, writer),
+            SampleFormat::I64 => Self::build_stream::<i64>(&device, config, writer),
+            SampleFormat::U8 => Self::build_stream::<u8>(&device, config, writer),
+            SampleFormat::U16 => Self::build_stream::<u16>(&device, config, writer),
+            SampleFormat::U24 => Self::build_stream::<cpal::U24>(&device, config, writer),
+            SampleFormat::U32 => Self::build_stream::<u32>(&device, config, writer),
+            SampleFormat::U64 => Self::build_stream::<u64>(&device, config, writer),
+            SampleFormat::F64 => Self::build_stream::<f64>(&device, config, writer),
             format => {
                 return Err(AppError::Unavailable(format!(
                     "unsupported audio sample format: {format}"
@@ -274,68 +314,39 @@ impl Recorder for CpalRecorder {
             AppError::Unavailable(format!("could not start audio input stream: {error}"))
         })?;
         self.stream = Some(stream);
-        self.capture = Some(capture);
-        self.stream_error = Some(stream_error);
+        self.source = Some(source);
+        self.integrity = Some(integrity);
         Ok(())
     }
 
     fn stop(&mut self) -> Result<()> {
-        let Some(stream) = self.stream.take() else {
-            return Err(AppError::InvalidState("recorder is not active".to_owned()));
-        };
-        drop(stream);
-        if let Some(error) = self
-            .stream_error
+        let stream = self
+            .stream
             .take()
-            .and_then(|slot| slot.lock().ok().and_then(|error| error.clone()))
-        {
-            warn!(error = %error, "audio input stream reported an error");
-        }
-        Ok(())
+            .ok_or_else(|| AppError::InvalidState("recorder is not active".to_owned()))?;
+        drop(stream);
+        self.integrity
+            .as_ref()
+            .expect("active capture integrity")
+            .result()
     }
 
     fn cancel(&mut self) -> Result<()> {
         self.stream.take();
-        self.capture.take();
-        self.stream_error.take();
+        self.source.take();
+        self.integrity.take();
         Ok(())
     }
 
-    fn audio_source(&self) -> Result<AudioSource> {
-        live_audio_source(&self.capture)
+    fn audio_source(&mut self) -> Result<AudioSource> {
+        take_audio_source(&mut self.source)
     }
 }
 
-fn live_audio_source(capture: &Option<Arc<Mutex<CaptureState>>>) -> Result<AudioSource> {
-    capture
-        .as_ref()
-        .map(|capture| AudioSource {
-            capture: Arc::clone(capture),
-        })
-        .ok_or_else(|| AppError::InvalidState("recorder is not active".to_owned()))
-}
-
-fn append_interleaved<T>(data: &[T], capture: &Arc<Mutex<CaptureState>>)
-where
-    T: Sample,
-    f32: cpal::FromSample<T>,
-{
-    let Ok(mut state) = capture.try_lock() else {
-        return;
-    };
-    let max_samples = state.sample_rate as usize * MAX_CAPTURE_SECONDS;
-    for frame in data.chunks(state.channels) {
-        if state.total_samples >= max_samples {
-            state.overflowed = true;
-            break;
-        }
-        let sum = frame
-            .iter()
-            .map(|sample| f32::from_sample(*sample))
-            .sum::<f32>();
-        state.samples.push_back(sum / frame.len() as f32);
-        state.total_samples += 1;
-    }
+fn take_audio_source(source: &mut Option<AudioSource>) -> Result<AudioSource> {
+    source.take().ok_or_else(|| {
+        AppError::InvalidState("capture consumer is unavailable or already acquired".to_owned())
+    })
 }
 
 #[cfg(test)]
@@ -343,11 +354,121 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_session_has_only_one_consumer() {
+        let mut recorder = NoopRecorder::default();
+        recorder.start().unwrap();
+        let _source = recorder.audio_source().unwrap();
+        assert!(recorder.audio_source().is_err());
+    }
+
+    #[test]
+    fn queue_loss_is_counted_without_overwriting_audio() {
+        let (mut writer, mut source) = capture_pair(16_000, 1, 2, 100);
+        writer.accept_interleaved(&[1.0_f32, 2.0, 3.0]);
+        assert_eq!(source.drain().unwrap(), vec![1.0, 2.0]);
+        let message = source.integrity_result().unwrap_err().to_string();
+        assert!(message.contains("1 mono samples dropped"));
+    }
+
+    #[test]
+    fn duration_counts_input_that_did_not_fit_the_queue() {
+        let (mut writer, source) = capture_pair(16_000, 1, 1, 2);
+        writer.accept_interleaved(&[1.0_f32, 2.0, 3.0]);
+        let message = source.integrity_result().unwrap_err().to_string();
+        assert!(message.contains("1 mono samples dropped"));
+        assert!(message.contains("30 minute limit"));
+        assert_eq!(writer.total_samples, 3);
+    }
+
+    #[test]
+    fn backend_failure_survives_an_unavailable_diagnostic_slot() {
+        let (_writer, source) = capture_pair(16_000, 1, 2, 100);
+        let guard = source.integrity.backend_message.lock().unwrap();
+        source.integrity.record_backend_error(&"injected device failure");
+        drop(guard);
+        let message = source.integrity_result().unwrap_err().to_string();
+        assert!(message.contains("backend capture error"));
+        assert!(!message.contains("mono samples dropped"));
+    }
+
+    #[test]
+    fn old_consumer_cannot_read_the_next_session() {
+        let mut recorder = NoopRecorder::default();
+        recorder.start().unwrap();
+        let mut old = recorder.audio_source().unwrap();
+        recorder.cancel().unwrap();
+        recorder.start().unwrap();
+        let mut new = recorder.audio_source().unwrap();
+        assert!(old.drain().unwrap().is_empty());
+        assert!(new.drain().unwrap().is_empty());
+        assert!(!Arc::ptr_eq(&old.integrity, &new.integrity));
+    }
+
+    #[test]
+    fn concurrent_producer_preserves_order_without_exceeding_capacity() {
+        use std::sync::Barrier;
+        let (mut writer, mut source) = capture_pair(16_000, 1, 64, 1_000);
+        let barrier = Arc::new(Barrier::new(2));
+        let producer_barrier = Arc::clone(&barrier);
+        let handle = std::thread::spawn(move || {
+            for batch in 0..4 {
+                let values = (batch * 64..(batch + 1) * 64)
+                    .map(|n| n as f32)
+                    .collect::<Vec<_>>();
+                writer.accept_interleaved(&values);
+                producer_barrier.wait();
+                producer_barrier.wait();
+            }
+        });
+        let mut actual = Vec::new();
+        for _ in 0..4 {
+            barrier.wait();
+            actual.extend(source.drain().unwrap());
+            barrier.wait();
+        }
+        handle.join().unwrap();
+        assert_eq!(actual, (0..256).map(|n| n as f32).collect::<Vec<_>>());
+        source.integrity_result().unwrap();
+    }
+
+    #[test]
+    fn final_sample_and_loss_are_visible_after_producer_join() {
+        use std::sync::Barrier;
+        let (mut writer, mut source) = capture_pair(16_000, 1, 1, 100);
+        let barrier = Arc::new(Barrier::new(2));
+        let producer_barrier = Arc::clone(&barrier);
+        let handle = std::thread::spawn(move || {
+            producer_barrier.wait();
+            writer.accept_interleaved(&[7.0_f32, 8.0]);
+        });
+        barrier.wait();
+        handle.join().unwrap();
+        assert_eq!(source.drain().unwrap(), vec![7.0]);
+        assert!(
+            source
+                .integrity_result()
+                .unwrap_err()
+                .to_string()
+                .contains("1 mono samples dropped")
+        );
+    }
+
+    #[test]
+    fn entry_snapshot_does_not_expand_with_new_audio() {
+        let (mut writer, mut source) = capture_pair(16_000, 1, 4, 100);
+        writer.accept_interleaved(&[1.0_f32, 2.0]);
+        let snapshot = source.consumer.slots();
+        writer.accept_interleaved(&[3.0_f32, 4.0]);
+        assert_eq!(source.drain_snapshot(snapshot).unwrap(), vec![1.0, 2.0]);
+        assert_eq!(source.drain().unwrap(), vec![3.0, 4.0]);
+    }
+
+    #[test]
     fn noop_recorder_exposes_a_live_source_after_start() {
         let mut recorder = NoopRecorder::default();
         assert!(recorder.audio_source().is_err());
         recorder.start().expect("start noop recorder");
-        let source = recorder.audio_source().expect("live source");
+        let mut source = recorder.audio_source().expect("live source");
         assert_eq!(source.sample_rate(), NOOP_SAMPLE_RATE);
         recorder.stop().expect("stop noop recorder");
         assert!(source.drain().expect("drain").is_empty());
@@ -355,12 +476,8 @@ mod tests {
 
     #[test]
     fn downmixes_interleaved_samples() {
-        let capture = Arc::new(Mutex::new(CaptureState::new(16_000, 2)));
-        append_interleaved(&[1.0_f32, -1.0, 0.5, 0.5], &capture);
-        let state = capture.lock().expect("capture lock");
-        assert_eq!(
-            state.samples.iter().copied().collect::<Vec<_>>(),
-            vec![0.0, 0.5]
-        );
+        let (mut writer, mut source) = capture_pair(16_000, 2, 2, 100);
+        writer.accept_interleaved(&[1.0_f32, -1.0, 0.5, 0.5]);
+        assert_eq!(source.drain().unwrap(), vec![0.0, 0.5]);
     }
 }
