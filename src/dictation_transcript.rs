@@ -207,9 +207,7 @@ fn is_filled_pause(token: &str) -> bool {
 
 #[derive(Clone, Copy, Debug)]
 struct TokenParts<'a> {
-    leading: &'a str,
     core: &'a str,
-    trailing: &'a str,
 }
 
 fn token_parts(token: &str) -> TokenParts<'_> {
@@ -223,19 +221,9 @@ fn token_parts(token: &str) -> TokenParts<'_> {
         )
     });
     if core.is_empty() {
-        return TokenParts {
-            leading: "",
-            core: token,
-            trailing: "",
-        };
+        return TokenParts { core: token };
     }
-    let start = token.len() - rest.len();
-    let end = start + core.len();
-    TokenParts {
-        leading: &token[..start],
-        core,
-        trailing: &token[end..],
-    }
+    TokenParts { core }
 }
 
 fn word_core(token: &str) -> &str {
