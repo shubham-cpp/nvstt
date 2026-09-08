@@ -128,16 +128,12 @@ fn run_recognition_worker(
 
         match command_rx.recv_timeout(Duration::from_millis(20)) {
             Ok(WorkerCommand::Finish) => {
-                finish_audio_if_healthy(
+                break Some(finish_worker_session(
                     &mut source,
                     recognizer.as_mut(),
                     &mut audio_pipeline,
-                    &mut worker_error,
-                );
-                break Some(match worker_error {
-                    Some(error) => Err(error),
-                    None => recognizer.finish_session(),
-                });
+                    worker_error.take(),
+                ));
             }
             Ok(WorkerCommand::Cancel) => {
                 let _ = recognizer.cancel_session();
@@ -169,15 +165,22 @@ fn feed_audio_if_healthy(
     }
 }
 
-fn finish_audio_if_healthy(
+fn finish_worker_session(
     source: &mut AudioSource,
     recognizer: &mut dyn StreamingRecognizer,
     audio_pipeline: &mut AudioPipeline,
-    worker_error: &mut Option<AppError>,
-) {
-    if worker_error.is_none() {
-        *worker_error = finish_audio(source, recognizer, audio_pipeline).err();
+    worker_error: Option<AppError>,
+) -> Result<RecognitionOutcome> {
+    if let Err(error) = source.integrity_result() {
+        let _ = recognizer.cancel_session();
+        return Err(error);
     }
+    if let Some(error) = worker_error {
+        let _ = recognizer.cancel_session();
+        return Err(error);
+    }
+    finish_audio(source, recognizer, audio_pipeline)?;
+    recognizer.finish_session()
 }
 
 fn feed_available_audio(
@@ -787,13 +790,280 @@ fn default_daemon(config: Config, paths: &AppPaths) -> Daemon {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use tempfile::tempdir;
 
     use super::*;
     use crate::{
         delivery::StaticSink, dictation_transcript::Replacements, history::JsonHistoryStore,
-        notifier::NoopNotifier,
+        notifier::NoopNotifier, recorder::TestCapture,
     };
+
+    #[derive(Default)]
+    struct Effects {
+        sent: Vec<String>,
+        records: Vec<HistoryRecord>,
+        delivery_updates: usize,
+    }
+
+    struct CountingSink(Arc<Mutex<Effects>>);
+
+    impl TextSink for CountingSink {
+        fn send_final_text(&mut self, text: &str) -> Result<DeliveryOutcome> {
+            self.0.lock().unwrap().sent.push(text.to_owned());
+            Ok(DeliveryOutcome::Delivered {
+                backend: "test".to_owned(),
+            })
+        }
+    }
+
+    struct CountingHistory(Arc<Mutex<Effects>>);
+
+    impl HistoryStore for CountingHistory {
+        fn append(&mut self, record: HistoryRecord) -> Result<()> {
+            self.0.lock().unwrap().records.push(record);
+            Ok(())
+        }
+
+        fn update_delivery(
+            &mut self,
+            _id: &str,
+            _status: DeliveryStatus,
+            _backend: Option<String>,
+        ) -> Result<()> {
+            self.0.lock().unwrap().delivery_updates += 1;
+            Ok(())
+        }
+
+        fn list(&self, limit: usize) -> Result<Vec<HistoryRecord>> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .records
+                .iter()
+                .rev()
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CaptureFault {
+        None,
+        Queue,
+        Backend,
+        Both,
+    }
+
+    struct FixtureRecorder {
+        fault: CaptureFault,
+        session: Option<TestCapture>,
+    }
+
+    impl Recorder for FixtureRecorder {
+        fn start(&mut self) -> Result<()> {
+            let mut session = TestCapture::new();
+            match self.fault {
+                CaptureFault::None => session.push(&[0.25]),
+                CaptureFault::Queue => session.push(&[0.25, 0.5, 0.75]),
+                CaptureFault::Backend => session.backend_error(),
+                CaptureFault::Both => {
+                    session.push(&[0.25, 0.5, 0.75]);
+                    session.backend_error();
+                }
+            }
+            self.fault = CaptureFault::None;
+            self.session = Some(session);
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            self.session.as_mut().unwrap().close();
+            // Deliberately return Ok: the worker must independently check integrity.
+            Ok(())
+        }
+
+        fn cancel(&mut self) -> Result<()> {
+            if let Some(mut session) = self.session.take() {
+                session.close();
+            }
+            Ok(())
+        }
+
+        fn audio_source(&mut self) -> Result<AudioSource> {
+            Ok(self.session.as_mut().unwrap().take_source())
+        }
+    }
+
+    struct StopErrorRecorder(FixtureRecorder);
+
+    impl Recorder for StopErrorRecorder {
+        fn start(&mut self) -> Result<()> {
+            self.0.start()
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            self.0.stop()?;
+            Err(AppError::Unavailable(
+                "injected backend capture error".to_owned(),
+            ))
+        }
+
+        fn cancel(&mut self) -> Result<()> {
+            self.0.cancel()
+        }
+
+        fn audio_source(&mut self) -> Result<AudioSource> {
+            self.0.audio_source()
+        }
+    }
+
+    fn observed_daemon(fault: CaptureFault) -> (Daemon, Arc<Mutex<Effects>>) {
+        let effects = Arc::new(Mutex::new(Effects::default()));
+        let mut daemon = Daemon::new(
+            Config::default(),
+            Box::new(FixtureRecorder {
+                fault,
+                session: None,
+            }),
+            Box::new(StaticRecognizer::new("final transcript")),
+            Box::new(CountingSink(Arc::clone(&effects))),
+            Box::new(CountingHistory(Arc::clone(&effects))),
+            Box::new(NoopNotifier::default()),
+        );
+        daemon.initialize();
+        (daemon, effects)
+    }
+
+    #[test]
+    fn successful_stop_delivers_once_and_only_after_stop() {
+        let (mut daemon, effects) = observed_daemon(CaptureFault::None);
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        {
+            let effects = effects.lock().unwrap();
+            assert!(effects.sent.is_empty());
+            assert!(effects.records.is_empty());
+            assert_eq!(effects.delivery_updates, 0);
+        }
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        let effects = effects.lock().unwrap();
+        assert_eq!(effects.sent, vec!["final transcript"]);
+        assert_eq!(effects.records.len(), 1);
+        assert_eq!(effects.records[0].transcript, "final transcript");
+        assert_eq!(effects.delivery_updates, 1);
+    }
+
+    #[test]
+    fn capture_failures_do_not_deliver_or_append_history_and_recover() {
+        for fault in [CaptureFault::Queue, CaptureFault::Backend, CaptureFault::Both] {
+            let (mut daemon, effects) = observed_daemon(fault);
+            assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+            let response = daemon.handle(IpcRequest::Toggle);
+            let IpcResponse::Command { result } = response else {
+                panic!("expected command")
+            };
+            assert!(!result.ok);
+            assert_eq!(result.transcription, TranscriptionStatus::Failed);
+            assert_eq!(result.delivery, DeliveryStatus::NotAttempted);
+            assert_eq!(result.status.state, DaemonState::Idle);
+            assert!(result.transcript.is_none());
+            {
+                let effects = effects.lock().unwrap();
+                assert!(effects.sent.is_empty());
+                assert!(effects.records.is_empty());
+                assert_eq!(effects.delivery_updates, 0);
+            }
+            assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+            assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+            let effects = effects.lock().unwrap();
+            assert_eq!(effects.sent, vec!["final transcript"]);
+            assert_eq!(effects.records.len(), 1);
+            assert_eq!(effects.records[0].transcript, "final transcript");
+            assert_eq!(effects.delivery_updates, 1);
+        }
+    }
+
+    #[test]
+    fn cancel_with_a_full_queue_has_no_effects_and_recovers() {
+        let (mut daemon, effects) = observed_daemon(CaptureFault::Queue);
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        assert!(daemon.handle(IpcRequest::Cancel).is_ok());
+        {
+            let effects = effects.lock().unwrap();
+            assert!(effects.sent.is_empty());
+            assert!(effects.records.is_empty());
+            assert_eq!(effects.delivery_updates, 0);
+        }
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        let effects = effects.lock().unwrap();
+        assert_eq!(effects.sent, vec!["final transcript"]);
+        assert_eq!(effects.records.len(), 1);
+        assert_eq!(effects.delivery_updates, 1);
+    }
+
+    #[test]
+    fn recorder_stop_error_never_reaches_history_or_delivery() {
+        let (mut daemon, effects) = observed_daemon(CaptureFault::None);
+        daemon.recorder = Box::new(StopErrorRecorder(FixtureRecorder {
+            fault: CaptureFault::None,
+            session: None,
+        }));
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        let IpcResponse::Command { result } = daemon.handle(IpcRequest::Toggle) else {
+            panic!("expected command")
+        };
+        assert!(!result.ok);
+        assert_eq!(result.transcription, TranscriptionStatus::Failed);
+        assert_eq!(result.delivery, DeliveryStatus::NotAttempted);
+        assert_eq!(result.status.state, DaemonState::Idle);
+        assert!(result.transcript.is_none());
+        let effects = effects.lock().unwrap();
+        assert!(effects.sent.is_empty());
+        assert!(effects.records.is_empty());
+        assert_eq!(effects.delivery_updates, 0);
+    }
+
+    #[test]
+    fn capture_failure_overrides_prior_worker_error_without_finalizing() {
+        struct MustNotFinish;
+        impl StreamingRecognizer for MustNotFinish {
+            fn start_session(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn accept_audio(&mut self, _rate: i32, _samples: &[f32]) -> Result<()> {
+                panic!("must not decode failed capture")
+            }
+
+            fn finish_session(&mut self) -> Result<RecognitionOutcome> {
+                panic!("must not finalize failed capture")
+            }
+
+            fn cancel_session(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut capture = TestCapture::new();
+        capture.push(&[1.0, 2.0, 3.0]);
+        capture.backend_error();
+        let mut source = capture.take_source();
+        capture.close();
+        let error = finish_worker_session(
+            &mut source,
+            &mut MustNotFinish,
+            &mut AudioPipeline::new(false),
+            Some(AppError::Unavailable("earlier recognizer failure".to_owned())),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("mono samples dropped"));
+        assert!(error.contains("backend capture error"));
+        assert!(!error.contains("earlier recognizer failure"));
+    }
 
     #[derive(Default)]
     struct CountingRecognizer {

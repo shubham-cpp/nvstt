@@ -350,6 +350,42 @@ fn take_audio_source(source: &mut Option<AudioSource>) -> Result<AudioSource> {
 }
 
 #[cfg(test)]
+pub(crate) struct TestCapture {
+    writer: Option<CaptureWriter>,
+    source: Option<AudioSource>,
+    integrity: Arc<CaptureIntegrity>,
+}
+
+#[cfg(test)]
+impl TestCapture {
+    pub(crate) fn new() -> Self {
+        let (writer, source) = capture_pair(16_000, 1, 2, 100);
+        Self {
+            integrity: Arc::clone(&source.integrity),
+            writer: Some(writer),
+            source: Some(source),
+        }
+    }
+
+    pub(crate) fn push(&mut self, samples: &[f32]) {
+        self.writer.as_mut().unwrap().accept_interleaved(samples);
+    }
+
+    pub(crate) fn backend_error(&self) {
+        self.integrity
+            .record_backend_error(&"injected backend failure");
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.writer.take();
+    }
+
+    pub(crate) fn take_source(&mut self) -> AudioSource {
+        self.source.take().unwrap()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -396,12 +432,33 @@ mod tests {
         let mut recorder = NoopRecorder::default();
         recorder.start().unwrap();
         let mut old = recorder.audio_source().unwrap();
+        recorder
+            .writer
+            .as_mut()
+            .unwrap()
+            .accept_interleaved(&[1.0_f32, 2.0]);
         recorder.cancel().unwrap();
         recorder.start().unwrap();
         let mut new = recorder.audio_source().unwrap();
+        recorder
+            .writer
+            .as_mut()
+            .unwrap()
+            .accept_interleaved(&[3.0_f32, 4.0]);
+        assert_eq!(old.drain().unwrap(), vec![1.0, 2.0]);
+        assert_eq!(new.drain().unwrap(), vec![3.0, 4.0]);
         assert!(old.drain().unwrap().is_empty());
         assert!(new.drain().unwrap().is_empty());
         assert!(!Arc::ptr_eq(&old.integrity, &new.integrity));
+    }
+
+    #[test]
+    fn producer_shutdown_does_not_need_a_live_consumer() {
+        let (mut writer, source) = capture_pair(16_000, 1, 1, 100);
+        writer.accept_interleaved(&[1.0_f32, 2.0]);
+        drop(source);
+        assert!(writer.producer.is_abandoned());
+        drop(writer);
     }
 
     #[test]
