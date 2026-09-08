@@ -939,6 +939,19 @@ mod tests {
     }
 
     #[test]
+    fn protected_technical_text_is_delivered_once_and_stored_exactly() {
+        let (mut daemon, effects) = observed_daemon(CaptureFault::None);
+        daemon.recognizer = Some(Box::new(StaticRecognizer::new("um ER diagram in C++.")));
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        assert!(effects.lock().unwrap().sent.is_empty());
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        let effects = effects.lock().unwrap();
+        assert_eq!(effects.sent, vec!["ER diagram in C++."]);
+        assert_eq!(effects.records.len(), 1);
+        assert_eq!(effects.records[0].transcript, "ER diagram in C++.");
+    }
+
+    #[test]
     fn successful_stop_delivers_once_and_only_after_stop() {
         let (mut daemon, effects) = observed_daemon(CaptureFault::None);
         assert!(daemon.handle(IpcRequest::Toggle).is_ok());

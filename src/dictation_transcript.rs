@@ -4,8 +4,8 @@
 //! The speech gate routes audio. This module decides whether finished
 //! recognition has text worth keeping. Ambiguous tokens remain.
 //!
-//! Order: collapse short stutters, strip filled pauses, apply user
-//! replacements, then optionally normalize spoken forms.
+//! Order: collapse short stutters, strip filled pauses, optionally normalize
+//! spoken forms, then apply user replacements.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeMap};
 use text_processing_rs::{NormalizeOptions, normalize_sentence_with_options};
@@ -36,11 +36,12 @@ pub struct EmptyTranscript;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReplacementRule {
+    original_pattern: String,
     pattern: Vec<String>,
     replacement: String,
 }
 
-/// User-defined substitutions applied after stutter collapse and filled pauses.
+/// User-defined substitutions applied after cleanup and optional normalization.
 ///
 /// Patterns match whole tokens, case-insensitively. Longer patterns win.
 /// The replacement text is used as written.
@@ -57,12 +58,12 @@ impl Replacements {
                 let tokens: Vec<String> = pattern
                     .split_whitespace()
                     .map(|token| word_core(token).to_ascii_lowercase())
-                    .filter(|token| !token.is_empty())
                     .collect();
                 if tokens.is_empty() {
                     return None;
                 }
                 Some(ReplacementRule {
+                    original_pattern: pattern,
                     pattern: tokens,
                     replacement,
                 })
@@ -85,7 +86,19 @@ impl Replacements {
                 return None;
             }
             let matched = rule.pattern.iter().enumerate().all(|(offset, expected)| {
-                word_core(tokens[index + offset]).eq_ignore_ascii_case(expected)
+                let parts = token_parts(tokens[index + offset]);
+                let interior_mark = rule.pattern.len() > 1
+                    && parts.core.chars().any(|c| matches!(c, '.' | '?' | '!' | ';' | ':'))
+                    && parts.core.chars().all(|c| matches!(c, '.' | '?' | '!' | ';' | ':'));
+                let interior_punctuation = offset > 0
+                    && offset + 1 < rule.pattern.len()
+                    && !parts.core.is_empty()
+                    && parts.core.chars().all(|c| !c.is_alphanumeric());
+                !interior_mark
+                    && !interior_punctuation
+                    && (offset == 0 || parts.leading.is_empty())
+                    && (offset + 1 == rule.pattern.len() || parts.trailing.is_empty())
+                    && parts.core.eq_ignore_ascii_case(expected)
             });
             matched.then_some((rule.pattern.len(), rule.replacement.as_str()))
         })
@@ -96,7 +109,7 @@ impl Serialize for Replacements {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(self.rules.len()))?;
         for rule in &self.rules {
-            map.serialize_entry(&rule.pattern.join(" "), &rule.replacement)?;
+            map.serialize_entry(&rule.original_pattern, &rule.replacement)?;
         }
         map.end()
     }
@@ -132,15 +145,17 @@ pub fn dictation_transcript(
         .into_iter()
         .filter(|token| !is_filled_pause(token))
         .collect();
-    let replaced = apply_replacements(&without_fillers, replacements).join(" ");
-    let cleaned = if itn {
+    let content = without_fillers.join(" ");
+    let normalized = if itn {
         normalize_sentence_with_options(
-            &replaced,
+            &content,
             NormalizeOptions::new().with_disable_bare_second(true),
         )
     } else {
-        replaced
+        content
     };
+    let normalized_tokens: Vec<&str> = normalized.split_whitespace().collect();
+    let cleaned = apply_replacements(&normalized_tokens, replacements).join(" ");
     if cleaned.is_empty() {
         Ok(DictationTranscript::NoContent)
     } else {
@@ -179,13 +194,34 @@ fn is_short_stutter_token(core: &str) -> bool {
         && !(core.len() >= 2 && core.bytes().all(|byte| byte.is_ascii_uppercase()))
 }
 
+fn wrapped_replacement(first: &str, last: &str, replacement: &str) -> String {
+    let leading = token_parts(first).leading;
+    let trailing = token_parts(last).trailing;
+    let marks_end = trailing
+        .char_indices()
+        .find(|(_, c)| !matches!(c, '.' | ',' | '?' | '!' | ';' | ':'))
+        .map(|(index, _)| index)
+        .unwrap_or(trailing.len());
+    let marks = &trailing[..marks_end];
+    let trailing = if !marks.is_empty() && replacement.ends_with(marks) {
+        &trailing[marks_end..]
+    } else {
+        trailing
+    };
+    format!("{leading}{replacement}{trailing}")
+}
+
 fn apply_replacements(tokens: &[&str], replacements: &Replacements) -> Vec<String> {
     let mut output = Vec::with_capacity(tokens.len());
     let mut index = 0;
     while index < tokens.len() {
         if let Some((length, replacement)) = replacements.match_at(tokens, index) {
             if !replacement.is_empty() {
-                output.push(replacement.to_owned());
+                output.push(wrapped_replacement(
+                    tokens[index],
+                    tokens[index + length - 1],
+                    replacement,
+                ));
             }
             index += length;
         } else {
@@ -207,7 +243,9 @@ fn is_filled_pause(token: &str) -> bool {
 
 #[derive(Clone, Copy, Debug)]
 struct TokenParts<'a> {
+    leading: &'a str,
     core: &'a str,
+    trailing: &'a str,
 }
 
 fn token_parts(token: &str) -> TokenParts<'_> {
@@ -221,9 +259,19 @@ fn token_parts(token: &str) -> TokenParts<'_> {
         )
     });
     if core.is_empty() {
-        return TokenParts { core: token };
+        return TokenParts {
+            leading: "",
+            core: token,
+            trailing: "",
+        };
     }
-    TokenParts { core }
+    let start = token.len() - rest.len();
+    let end = start + core.len();
+    TokenParts {
+        leading: &token[..start],
+        core,
+        trailing: &token[end..],
+    }
 }
 
 fn word_core(token: &str) -> &str {
@@ -252,6 +300,103 @@ mod tests {
                 .map(|(pattern, replacement)| ((*pattern).to_owned(), (*replacement).to_owned())),
         );
         dictation_transcript(transcript(text), &replacements, false)
+    }
+
+    #[test]
+    fn replacements_preserve_identity_and_sentence_wrappers() {
+        let cases: &[(&str, &[(&str, &str)], &str)] = &[
+            (
+                "C C++ C#",
+                &[("C", "cee"), ("C++", "cpp"), ("C#", "csharp")],
+                "cee cpp csharp",
+            ),
+            ("\"nv stt.\"", &[("nv stt", "nvstt")], "\"nvstt.\""),
+            ("nv stt.", &[("nv stt", "nvstt.")], "nvstt."),
+            ("nv. stt", &[("nv stt", "nvstt")], "nv. stt"),
+            ("nv, stt", &[("nv stt", "nvstt")], "nv, stt"),
+            ("keep \"scratch that.\"", &[("scratch that", "")], "keep"),
+            (
+                ".env config.rs",
+                &[("env", "wrong"), ("config", "wrong")],
+                ".env config.rs",
+            ),
+            (".", &[(".", "")], ""),
+            ("“nv stt.”", &[("nv stt", "nvstt.")], "“nvstt.”"),
+            ("[nv stt?!]", &[("nv stt", "nvstt?!")], "[nvstt?!]"),
+            ("nv \"stt", &[("nv stt", "nvstt")], "nv \"stt"),
+            ("nv . stt", &[("nv . stt", "nvstt")], "nv . stt"),
+            ("keep scratch that .", &[("scratch that", "")], "keep ."),
+        ];
+        for (input, pairs, expected) in cases {
+            let expected = if expected.is_empty() {
+                DictationTranscript::NoContent
+            } else {
+                DictationTranscript::Ready((*expected).to_owned())
+            };
+            assert_eq!(clean_with(input, pairs), Ok(expected), "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn phrase_replacements_do_not_swallow_standalone_punctuation() {
+        let cases: &[(&str, &[(&str, &str)], &str)] = &[
+            ("nv , stt", &[("nv , stt", "nvstt")], "nv , stt"),
+            ("nv \" stt", &[("nv \" stt", "nvstt")], "nv \" stt"),
+            ("nv [ stt", &[("nv [ stt", "nvstt")], "nv [ stt"),
+            ("nv ] stt", &[("nv ] stt", "nvstt")], "nv ] stt"),
+            (",", &[(",", "comma")], "comma"),
+            (".", &[(".", "period")], "period"),
+        ];
+        for (input, pairs, expected) in cases {
+            assert_eq!(
+                clean_with(input, pairs),
+                Ok(DictationTranscript::Ready((*expected).to_owned())),
+                "input={input:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_patterns_match_but_values_are_not_normalized_again() {
+        let rules = Replacements::from_pairs([("12".to_owned(), "twenty one".to_owned())]);
+        assert_eq!(
+            dictation_transcript(transcript("twelve"), &rules, true),
+            Ok(DictationTranscript::Ready("twenty one".to_owned())),
+        );
+        assert_eq!(
+            dictation_transcript(transcript("twelve"), &rules, false),
+            Ok(DictationTranscript::Ready("twelve".to_owned())),
+        );
+    }
+
+    #[test]
+    fn itn_dot_limitation_is_explicit() {
+        assert_eq!(clean("DOT"), Ok(DictationTranscript::Ready("DOT".to_owned())));
+        assert_eq!(
+            dictation_transcript(transcript("DOT"), &Replacements::default(), true),
+            Ok(DictationTranscript::Ready(".".to_owned())),
+        );
+        let raw_rule = Replacements::from_pairs([("DOT".to_owned(), "Graphviz".to_owned())]);
+        assert_eq!(
+            dictation_transcript(transcript("DOT"), &raw_rule, true),
+            Ok(DictationTranscript::Ready(".".to_owned())),
+        );
+    }
+
+    #[test]
+    fn technical_pattern_keys_survive_serialization() {
+        let rules = Replacements::from_pairs([
+            ("C".to_owned(), "cee".to_owned()),
+            ("C++".to_owned(), "cpp".to_owned()),
+            ("C#".to_owned(), "csharp".to_owned()),
+            (".env".to_owned(), "environment".to_owned()),
+        ]);
+        let value = serde_json::to_value(&rules).unwrap();
+        assert_eq!(value["C++"], "cpp");
+        assert_eq!(value["C#"], "csharp");
+        assert_eq!(value[".env"], "environment");
+        let restored: Replacements = serde_json::from_value(value).unwrap();
+        assert_eq!(rules, restored);
     }
 
     #[test]
@@ -457,12 +602,12 @@ mod tests {
     }
 
     #[test]
-    fn inverse_text_normalization_runs_after_replacements() {
+    fn replacement_values_bypass_normalization() {
         let replacements =
             Replacements::from_pairs([("a dozen".to_owned(), "twenty one".to_owned())]);
         assert_eq!(
             dictation_transcript(transcript("I have a dozen apples"), &replacements, true),
-            Ok(DictationTranscript::Ready("I have 21 apples".to_owned()))
+            Ok(DictationTranscript::Ready("I have twenty one apples".to_owned()))
         );
     }
 

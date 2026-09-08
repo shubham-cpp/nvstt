@@ -450,6 +450,15 @@ mod tests {
     }
 
     #[test]
+    fn replacement_table_keeps_technical_keys_in_toml() {
+        let input = "\"C++\" = \"cpp\"\n\"C#\" = \"csharp\"\n\".env\" = \"environment\"\n";
+        let rules: crate::dictation_transcript::Replacements = toml::from_str(input).unwrap();
+        let encoded = toml::to_string(&rules).unwrap();
+        let restored: crate::dictation_transcript::Replacements = toml::from_str(&encoded).unwrap();
+        assert_eq!(rules, restored);
+    }
+
+    #[test]
     fn loads_text_replacements() {
         let directory = tempdir().expect("temporary config directory");
         let path = directory.path().join("config.toml");
