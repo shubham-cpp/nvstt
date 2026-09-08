@@ -160,6 +160,8 @@ pub struct AudioSource {
     consumer: Consumer<f32>,
     sample_rate: i32,
     integrity: Arc<CaptureIntegrity>,
+    #[cfg(test)]
+    drain_step: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 }
 
 fn capture_pair(
@@ -182,6 +184,8 @@ fn capture_pair(
             consumer,
             sample_rate,
             integrity,
+            #[cfg(test)]
+            drain_step: None,
         },
     )
 }
@@ -202,6 +206,13 @@ impl AudioSource {
             samples.push(self.consumer.pop().map_err(|_| {
                 AppError::Unavailable("capture queue snapshot became unreadable".to_owned())
             })?);
+            #[cfg(test)]
+            if let Some((popped, resume)) = &self.drain_step {
+                popped.send(()).expect("notify producer after a live pop");
+                resume
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("producer must release the live drain");
+            }
         }
         Ok(samples)
     }
@@ -417,6 +428,29 @@ mod tests {
     }
 
     #[test]
+    fn duration_boundary_is_independent_of_queue_capacity() {
+        for (input, expected, exceeded) in [
+            (&[1.0_f32][..], &[1.0_f32][..], false),
+            (&[1.0_f32, 2.0][..], &[1.0_f32, 2.0][..], false),
+            (&[1.0_f32, 2.0, 3.0][..], &[1.0_f32, 2.0][..], true),
+        ] {
+            let (mut writer, mut source) = capture_pair(16_000, 1, 4, 2);
+            writer.accept_interleaved(input);
+            assert_eq!(writer.total_samples, input.len());
+            drop(writer);
+            assert_eq!(source.drain().unwrap(), expected);
+            assert_eq!(source.integrity.dropped_samples.load(Ordering::SeqCst), 0);
+            if exceeded {
+                let message = source.integrity_result().unwrap_err().to_string();
+                assert!(message.contains("30 minute limit"));
+                assert!(!message.contains("mono samples dropped"));
+            } else {
+                source.integrity_result().unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn backend_failure_survives_an_unavailable_diagnostic_slot() {
         let (_writer, source) = capture_pair(16_000, 1, 2, 100);
         let guard = source.integrity.backend_message.lock().unwrap();
@@ -485,6 +519,44 @@ mod tests {
         }
         handle.join().unwrap();
         assert_eq!(actual, (0..256).map(|n| n as f32).collect::<Vec<_>>());
+        source.integrity_result().unwrap();
+    }
+
+    #[test]
+    fn live_drain_stays_bounded_while_each_pop_allows_more_publication() {
+        use std::sync::{Barrier, mpsc};
+        use std::time::Duration;
+
+        let (mut writer, mut source) = capture_pair(16_000, 1, 4, 100);
+        writer.accept_interleaved(&[0.0_f32, 1.0, 2.0, 3.0]);
+        let start = Arc::new(Barrier::new(2));
+        let producer_start = Arc::clone(&start);
+        let (popped_tx, popped_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        source.drain_step = Some((popped_tx, resume_rx));
+        let producer = std::thread::spawn(move || {
+            producer_start.wait();
+            // Channel pairs form per-pop barriers with deadlock failure guards.
+            for value in [4.0_f32, 5.0, 6.0, 7.0] {
+                popped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                writer.accept_interleaved(&[value]);
+                resume_tx.send(()).unwrap();
+            }
+            drop(popped_rx);
+            drop(resume_tx);
+            // Keep the producer open until both actual drains have returned.
+            finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        start.wait();
+        let first = source.drain().unwrap();
+        source.drain_step = None;
+        let remaining = source.drain().unwrap();
+        finished_tx.send(()).unwrap();
+        producer.join().unwrap();
+        assert_eq!(first, vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(remaining, vec![4.0, 5.0, 6.0, 7.0]);
+        assert!(source.drain().unwrap().is_empty());
         source.integrity_result().unwrap();
     }
 

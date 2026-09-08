@@ -197,18 +197,12 @@ fn is_short_stutter_token(core: &str) -> bool {
 fn wrapped_replacement(first: &str, last: &str, replacement: &str) -> String {
     let leading = token_parts(first).leading;
     let trailing = token_parts(last).trailing;
-    let marks_end = trailing
-        .char_indices()
-        .find(|(_, c)| !matches!(c, '.' | ',' | '?' | '!' | ';' | ':'))
-        .map(|(index, _)| index)
-        .unwrap_or(trailing.len());
-    let marks = &trailing[..marks_end];
-    let trailing = if !marks.is_empty() && replacement.ends_with(marks) {
-        &trailing[marks_end..]
-    } else {
-        trailing
-    };
-    format!("{leading}{replacement}{trailing}")
+    let is_mark = |c: char| matches!(c, '.' | ',' | '?' | '!' | ';' | ':');
+    let marks: String = trailing.chars().filter(|&c| is_mark(c)).collect();
+    let omit_marks = !marks.is_empty() && replacement.ends_with(&marks);
+    let mut output = format!("{leading}{replacement}");
+    output.extend(trailing.chars().filter(|&c| !omit_marks || !is_mark(c)));
+    output
 }
 
 fn apply_replacements(tokens: &[&str], replacements: &Replacements) -> Vec<String> {
@@ -335,6 +329,76 @@ mod tests {
             };
             assert_eq!(clean_with(input, pairs), Ok(expected), "input={input:?}");
         }
+    }
+
+    #[test]
+    fn replacement_marks_around_closing_quotes() {
+        for (input, expected) in [
+            ("“nv stt.”", "“nvstt.”"),
+            ("“nv stt!”", "“nvstt.!”"),
+            ("“nv stt”!", "“nvstt.”!"),
+            ("“nv stt”.", "“nvstt.”"),
+            ("\"nv stt\".", "\"nvstt.\""),
+        ] {
+            assert_eq!(
+                clean_with(input, &[("nv stt", "nvstt.")]),
+                Ok(DictationTranscript::Ready(expected.to_owned())),
+                "input={input:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_marks_around_closing_parentheses() {
+        for (input, expected) in [
+            ("(nv stt.)", "(nvstt.)"),
+            ("(nv stt?)", "(nvstt.?)"),
+            ("(nv stt)?", "(nvstt.)?"),
+            ("(nv stt).", "(nvstt.)"),
+        ] {
+            assert_eq!(
+                clean_with(input, &[("nv stt", "nvstt.")]),
+                Ok(DictationTranscript::Ready(expected.to_owned())),
+                "input={input:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_marks_around_closing_brackets() {
+        for (input, expected) in [
+            ("[nv stt?!]", "[nvstt?!]"),
+            ("[nv stt.]", "[nvstt?!.]"),
+            ("[nv stt].", "[nvstt?!]."),
+            ("[nv stt]?!", "[nvstt?!]"),
+            ("{nv stt}?!", "{nvstt?!}"),
+        ] {
+            assert_eq!(
+                clean_with(input, &[("nv stt", "nvstt?!")]),
+                Ok(DictationTranscript::Ready(expected.to_owned())),
+                "input={input:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn matching_mark_sequence_ignores_intervening_wrappers() {
+        assert_eq!(
+            clean_with("[nv stt?]!", &[("nv stt", "nvstt?!")]),
+            Ok(DictationTranscript::Ready("[nvstt?!]".to_owned())),
+        );
+    }
+
+    #[test]
+    fn differing_mark_sequence_keeps_all_marks_and_wrappers() {
+        assert_eq!(
+            clean_with("[nv stt?]!", &[("nv stt", "nvstt.")]),
+            Ok(DictationTranscript::Ready("[nvstt.?]!".to_owned())),
+        );
+        assert_eq!(
+            clean_with("[nv stt?]!", &[("nv stt", "nvstt!")]),
+            Ok(DictationTranscript::Ready("[nvstt!?]!".to_owned())),
+        );
     }
 
     #[test]

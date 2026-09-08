@@ -36,6 +36,8 @@ struct RecognitionWorker {
     command_tx: Sender<WorkerCommand>,
     completion_rx: Receiver<WorkerCompletion>,
     join: Option<thread::JoinHandle<()>>,
+    #[cfg(test)]
+    finish_sent: Option<Sender<()>>,
 }
 
 enum WorkerCommand {
@@ -68,6 +70,8 @@ impl RecognitionWorker {
             command_tx,
             completion_rx,
             join: Some(join),
+            #[cfg(test)]
+            finish_sent: None,
         })
     }
 
@@ -75,6 +79,10 @@ impl RecognitionWorker {
         self.command_tx.send(WorkerCommand::Finish).map_err(|_| {
             AppError::Unavailable("recognition worker stopped unexpectedly".to_owned())
         })?;
+        #[cfg(test)]
+        if let Some(sent) = self.finish_sent.take() {
+            sent.send(()).expect("notify test that Finish is queued");
+        }
         let join_result = self.join.take().expect("worker join handle").join();
         if join_result.is_err() {
             return Err(AppError::Unavailable(
@@ -898,6 +906,53 @@ mod tests {
         }
     }
 
+    struct ThreadedRecorder {
+        source: Option<AudioSource>,
+        producer: Option<thread::JoinHandle<()>>,
+        callback_pause: Option<(Sender<()>, Receiver<()>)>,
+        stop_events: Sender<&'static str>,
+    }
+
+    impl Recorder for ThreadedRecorder {
+        fn start(&mut self) -> Result<()> {
+            let mut capture = TestCapture::new();
+            self.source = Some(capture.take_source());
+            let pause = self.callback_pause.take();
+            self.producer = Some(thread::spawn(move || {
+                capture.push(&[0.25]);
+                if let Some((entered, resume)) = pause {
+                    entered.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                    // The last callback completes only after stop has begun.
+                    capture.push(&[0.5]);
+                    capture.backend_error();
+                }
+                capture.close();
+            }));
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            self.stop_events.send("stop entered").unwrap();
+            self.producer.take().unwrap().join().unwrap();
+            self.stop_events.send("producer joined").unwrap();
+            // As with FixtureRecorder, require the real worker integrity check.
+            Ok(())
+        }
+
+        fn cancel(&mut self) -> Result<()> {
+            if let Some(producer) = self.producer.take() {
+                producer.join().unwrap();
+            }
+            self.source.take();
+            Ok(())
+        }
+
+        fn audio_source(&mut self) -> Result<AudioSource> {
+            Ok(self.source.take().unwrap())
+        }
+    }
+
     struct StopErrorRecorder(FixtureRecorder);
 
     impl Recorder for StopErrorRecorder {
@@ -991,6 +1046,136 @@ mod tests {
             }
             assert!(daemon.handle(IpcRequest::Toggle).is_ok());
             assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+            let effects = effects.lock().unwrap();
+            assert_eq!(effects.sent, vec!["final transcript"]);
+            assert_eq!(effects.records.len(), 1);
+            assert_eq!(effects.records[0].transcript, "final transcript");
+            assert_eq!(effects.delivery_updates, 1);
+        }
+    }
+
+    #[test]
+    fn stop_during_callback_checks_stable_failure_before_final_decode_and_recovers() {
+        #[derive(Default)]
+        struct Calls {
+            samples: Vec<f32>,
+            finishes: usize,
+            cancels: usize,
+        }
+
+        struct PausedRecognizer {
+            calls: Arc<Mutex<Calls>>,
+            first_audio: Option<(Sender<()>, Receiver<()>)>,
+            fail_first_audio: bool,
+        }
+
+        impl StreamingRecognizer for PausedRecognizer {
+            fn start_session(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn accept_audio(&mut self, rate: i32, samples: &[f32]) -> Result<()> {
+                assert_eq!(rate, MODEL_SAMPLE_RATE);
+                self.calls.lock().unwrap().samples.extend_from_slice(samples);
+                if let Some((entered, resume)) = self.first_audio.take() {
+                    entered.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                    if self.fail_first_audio {
+                        return Err(AppError::Unavailable("earlier recognizer failure".to_owned()));
+                    }
+                }
+                Ok(())
+            }
+
+            fn finish_session(&mut self) -> Result<RecognitionOutcome> {
+                self.calls.lock().unwrap().finishes += 1;
+                Ok(RecognitionOutcome::Transcript("final transcript".to_owned()))
+            }
+
+            fn cancel_session(&mut self) -> Result<()> {
+                self.calls.lock().unwrap().cancels += 1;
+                Ok(())
+            }
+        }
+
+        for fail_first_audio in [false, true] {
+            let (callback_entered_tx, callback_entered_rx) = mpsc::channel();
+            let (callback_resume_tx, callback_resume_rx) = mpsc::channel();
+            let (audio_entered_tx, audio_entered_rx) = mpsc::channel();
+            let (audio_resume_tx, audio_resume_rx) = mpsc::channel();
+            let (stop_tx, stop_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel();
+            let calls = Arc::new(Mutex::new(Calls::default()));
+            let (mut daemon, effects) = observed_daemon(CaptureFault::None);
+            daemon.config.denoise = false;
+            daemon.recorder = Box::new(ThreadedRecorder {
+                source: None,
+                producer: None,
+                callback_pause: Some((callback_entered_tx, callback_resume_rx)),
+                stop_events: stop_tx,
+            });
+            daemon.recognizer = Some(Box::new(PausedRecognizer {
+                calls: Arc::clone(&calls),
+                first_audio: Some((audio_entered_tx, audio_resume_rx)),
+                fail_first_audio,
+            }));
+            assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+            daemon.worker.as_mut().unwrap().finish_sent = Some(finish_tx);
+            // Bounded receives are deadlock guards, not elapsed-time assertions.
+            callback_entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            audio_entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            {
+                let effects = effects.lock().unwrap();
+                assert!(effects.sent.is_empty());
+                assert!(effects.records.is_empty());
+                assert_eq!(effects.delivery_updates, 0);
+            }
+            let stop = thread::spawn(move || {
+                let response = daemon.handle(IpcRequest::Toggle);
+                (daemon, response)
+            });
+            assert_eq!(
+                stop_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                "stop entered",
+            );
+            assert_eq!(calls.lock().unwrap().samples, vec![0.25]);
+            assert_eq!(calls.lock().unwrap().finishes, 0);
+            callback_resume_tx.send(()).unwrap();
+            assert_eq!(
+                stop_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                "producer joined",
+            );
+            // Do not let the live worker drain the final sample before Finish.
+            finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            audio_resume_tx.send(()).unwrap();
+            let (mut daemon, response) = stop.join().unwrap();
+            let IpcResponse::Command { result } = response else {
+                panic!("expected command")
+            };
+            assert!(!result.ok);
+            assert_eq!(result.transcription, TranscriptionStatus::Failed);
+            assert_eq!(result.delivery, DeliveryStatus::NotAttempted);
+            assert_eq!(result.status.state, DaemonState::Idle);
+            assert!(result.transcript.is_none());
+            assert!(result.message.contains("backend capture error"));
+            assert!(!result.message.contains("mono samples dropped"));
+            assert!(!result.message.contains("earlier recognizer failure"));
+            {
+                let calls = calls.lock().unwrap();
+                assert_eq!(calls.samples, vec![0.25]);
+                assert_eq!(calls.finishes, 0);
+                assert!(calls.cancels > 0);
+                let effects = effects.lock().unwrap();
+                assert!(effects.sent.is_empty());
+                assert!(effects.records.is_empty());
+                assert_eq!(effects.delivery_updates, 0);
+            }
+            assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+            assert!(effects.lock().unwrap().sent.is_empty());
+            assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.samples, vec![0.25, 0.25]);
+            assert_eq!(calls.finishes, 1);
             let effects = effects.lock().unwrap();
             assert_eq!(effects.sent, vec!["final transcript"]);
             assert_eq!(effects.records.len(), 1);
