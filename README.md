@@ -64,9 +64,38 @@ The audio worker uses FFT resampling for all non-16 kHz input. Set
 `audio.denoise = true` to enable RNNoise before recognition. Denoise is off by
 default.
 
+Capture uses a bounded queue. If the queue loses audio or the input backend
+reports a stream error, nvstt rejects that session. It does not type or save
+a partial transcript. Start another session after correcting the input issue.
+
+The five-second queue capacity is provisional. It does not guarantee a
+five-second recording limit or any particular insertion latency. The separate
+30-minute session limit stays unchanged.
+
+Cleanup removes clear lowercase or title-case `uh` and `um` variants.
+Ambiguous words, uppercase acronyms, and technical symbols remain.
+
 Inverse text normalization is on by default. It converts spoken numbers,
 dates, money, and measurements to written forms. Set `text.itn = false` to
 keep the spoken forms. The phrase `give me a second` keeps the word `second`.
+
+Inverse text normalization runs before `[text.replacements]`. Patterns see
+normalized text when `text.itn = true`. Replacement values receive no later
+normalization. Existing replacement patterns may need adjustment.
+
+Multiword replacement rules cannot consume interior punctuation-only tokens,
+even when the configured pattern includes them. Single-token punctuation
+mappings remain allowed. For example, `"nv , stt" = "nvstt"` does not match
+`nv , stt`, but `"," = "comma"` can replace a standalone comma.
+
+ITN can still change literal technical words. For example, `DOT` becomes `.`.
+Set `text.itn = false` when literal technical wording matters more than
+spoken-number and punctuation conversion. This repair does not change your
+configuration automatically.
+
+See [ADR 0013](docs/adr/0013-dictation-integrity.md) for compatibility changes
+and validation limits. The public CLI, IPC, and configuration schemas stay
+unchanged, as does the history format.
 
 The closed registry supports Nemotron profiles 80 ms, 160 ms, 560 ms, and
 1120 ms. It also supports Parakeet Unified profiles 240 ms, 560 ms, and
