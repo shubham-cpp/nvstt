@@ -238,8 +238,15 @@ impl RecordingStore {
                 continue;
             };
             let path = entry.path();
-            if !expected_files(&path, true)? {
-                continue;
+            match expected_files(&path, true) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(AppError::Io(error))
+                    if error.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
             let Ok(contents) = fs::read(path.join("metadata.json")) else {
                 continue;
@@ -669,6 +676,23 @@ mod tests {
             "injected pre-commit failure: p50={} ms p95={} ms",
             failure_times[9], failure_times[18]
         );
+    }
+
+    #[test]
+    fn unreadable_foreign_directory_does_not_block_saving_or_get_pruned() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("recordings");
+        let store = RecordingStore::new(root.clone());
+        store.save(&fixture(0, &[])).unwrap();
+        let foreign = root.join("00000000000000000001-1700000000000-99");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("notes.txt"), b"keep").unwrap();
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o000)).unwrap();
+        let saved = store.save(&fixture(1, &[0.25])).unwrap();
+        store.reconcile().unwrap();
+        assert!(saved.path.join("audio.wav").is_file());
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(fs::read(foreign.join("notes.txt")).unwrap(), b"keep");
     }
 
     #[test]

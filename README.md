@@ -158,8 +158,10 @@ find "$recordings" -mindepth 2 -maxdepth 2 -type f -name audio.wav \
   done
 ```
 
-Select `audio.wav` only from a committed session directory that contains
-`metadata.json`. Other WAV files are not necessarily nvstt recordings.
+The shell list gives candidate WAV paths, not proof of committed recordings.
+It checks only that `metadata.json` exists; it does not check its contents.
+Select `audio.wav` only after you check its session metadata. Other WAV files
+are not necessarily nvstt recordings.
 The `capture` fields in the metadata mark partial recordings: nonzero
 `dropped_samples` or a true `backend_failed`, `duration_exceeded`,
 `stop_failed`, or `drain_failed` means audio can be missing. There is no

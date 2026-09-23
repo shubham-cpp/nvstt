@@ -2114,6 +2114,148 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn measure_two_minute_stop_to_result_with_and_without_storage() {
+        struct SyntheticRecorder {
+            samples: Arc<Vec<f32>>,
+            source: Option<AudioSource>,
+        }
+
+        impl Recorder for SyntheticRecorder {
+            fn start(&mut self) -> Result<()> {
+                self.source = Some(AudioSource::test_source(
+                    48_000,
+                    self.samples.as_ref().clone(),
+                ));
+                Ok(())
+            }
+            fn stop(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn cancel(&mut self) -> Result<()> {
+                self.source.take();
+                Ok(())
+            }
+            fn audio_source(&mut self) -> Result<AudioSource> {
+                Ok(self.source.take().unwrap())
+            }
+        }
+
+        struct SignalingRecognizer {
+            inner: StaticRecognizer,
+            ready: Sender<()>,
+            sent: bool,
+        }
+
+        impl StreamingRecognizer for SignalingRecognizer {
+            fn start_session(&mut self) -> Result<()> {
+                self.sent = false;
+                self.inner.start_session()
+            }
+            fn accept_audio(&mut self, rate: i32, samples: &[f32]) -> Result<()> {
+                self.inner.accept_audio(rate, samples)?;
+                if !self.sent {
+                    self.ready.send(()).unwrap();
+                    self.sent = true;
+                }
+                Ok(())
+            }
+            fn finish_session(&mut self) -> Result<RecognitionOutcome> {
+                self.inner.finish_session()
+            }
+            fn cancel_session(&mut self) -> Result<()> {
+                self.inner.cancel_session()
+            }
+        }
+
+        fn trial(daemon: &mut Daemon, ready: &Receiver<()>, expect_warning: bool) -> f64 {
+            assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+            // Wait outside the timer until the worker has consumed and processed
+            // the synthetic 120-second source, as it would during listening.
+            ready.recv_timeout(Duration::from_secs(30)).unwrap();
+            let started = Instant::now();
+            let response = daemon.handle(IpcRequest::Toggle);
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            let IpcResponse::Command { result } = response else {
+                panic!("expected command result")
+            };
+            assert!(result.ok, "{}", result.message);
+            assert_eq!(result.transcription, TranscriptionStatus::Succeeded);
+            assert_eq!(result.delivery, DeliveryStatus::Delivered);
+            assert_eq!(
+                result.message.contains("audio was not saved"),
+                expect_warning
+            );
+            ms
+        }
+
+        let samples = Arc::new(vec![0.25_f32; 48_000 * 120]);
+        let (mut saved, saved_effects, saved_dir) = observed_daemon(CaptureFault::None);
+        let (mut control, control_effects, control_dir) = observed_daemon(CaptureFault::None);
+        for daemon in [&mut saved, &mut control] {
+            daemon.recorder = Box::new(SyntheticRecorder {
+                samples: Arc::clone(&samples),
+                source: None,
+            });
+        }
+        let (saved_ready_tx, saved_ready_rx) = mpsc::channel();
+        let (control_ready_tx, control_ready_rx) = mpsc::channel();
+        for (daemon, ready) in [
+            (&mut saved, saved_ready_tx),
+            (&mut control, control_ready_tx),
+        ] {
+            daemon.recognizer = Some(Box::new(SignalingRecognizer {
+                inner: StaticRecognizer::new("final transcript"),
+                ready,
+                sent: false,
+            }));
+        }
+        let blocked_root = control_dir.path().join("blocked-recordings");
+        fs::write(&blocked_root, b"keep").unwrap();
+        control.recordings = RecordingStore::new(blocked_root.clone());
+
+        let mut saved_ms = Vec::new();
+        let mut control_ms = Vec::new();
+        for n in 0..20 {
+            // Alternate order to limit bias from cache and filesystem warmup.
+            if n % 2 == 0 {
+                control_ms.push(trial(&mut control, &control_ready_rx, true));
+                saved_ms.push(trial(&mut saved, &saved_ready_rx, false));
+            } else {
+                saved_ms.push(trial(&mut saved, &saved_ready_rx, false));
+                control_ms.push(trial(&mut control, &control_ready_rx, true));
+            }
+        }
+        let saved_trials = saved_ms.clone();
+        let control_trials = control_ms.clone();
+        saved_ms.sort_by(f64::total_cmp);
+        control_ms.sort_by(f64::total_cmp);
+        println!("saved stop-to-result ms (20): {saved_trials:?}");
+        println!("blocked-store control stop-to-result ms (20): {control_trials:?}");
+        println!(
+            "saved p50={:.2} ms p95={:.2} ms; control p50={:.2} ms p95={:.2} ms; delta p50={:.2} ms p95={:.2} ms",
+            saved_ms[9],
+            saved_ms[18],
+            control_ms[9],
+            control_ms[18],
+            saved_ms[9] - control_ms[9],
+            saved_ms[18] - control_ms[18],
+        );
+        assert_eq!(saved_effects.lock().unwrap().sent.len(), 20);
+        assert_eq!(control_effects.lock().unwrap().sent.len(), 20);
+        assert_eq!(fs::read(blocked_root).unwrap(), b"keep");
+        let saved_entries = saved_recordings(&saved_dir);
+        assert_eq!(saved_entries.len(), 7);
+        assert!(
+            saved_entries
+                .iter()
+                .all(|(meta, wave)| meta.frames == samples.len()
+                    && wave.sample_rate == 48_000
+                    && wave.samples.len() == samples.len())
+        );
+    }
+
+    #[test]
     fn parakeet_rollback_configuration_keeps_final_only_delivery() {
         let directory = tempdir().expect("temporary directory");
         let config = Config::for_model(crate::config::PARAKEET_UNIFIED_MODEL, "1120ms")
