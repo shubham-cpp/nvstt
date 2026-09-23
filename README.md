@@ -152,15 +152,20 @@ else
   recordings="$HOME/.local/state/nvstt/recordings"  # ~/.local/state/nvstt/recordings
 fi
 find "$recordings" -mindepth 2 -maxdepth 2 -type f -name audio.wav \
-  ! -path "$recordings/.staging-*/audio.wav" -print
+  ! -path "$recordings/.staging-*/audio.wav" -print |
+  while IFS= read -r wav; do
+    [ -f "${wav%/*}/metadata.json" ] && printf '%s\n' "$wav"
+  done
 ```
 
-Each committed session directory contains `audio.wav` and `metadata.json`.
+Select `audio.wav` only from a committed session directory that contains
+`metadata.json`. Other WAV files are not necessarily nvstt recordings.
 The `capture` fields in the metadata mark partial recordings: nonzero
 `dropped_samples` or a true `backend_failed`, `duration_exceeded`,
 `stop_failed`, or `drain_failed` means audio can be missing. There is no
-separate `partial` key. These files are restricted to the user, but they are
-not encrypted. Backups and other processes with account access can copy them.
+separate `partial` key. Recording directories use mode `0700`; `audio.wav`
+and `metadata.json` use mode `0600`. These files are not encrypted. Backups
+and other processes with account access can copy them.
 Review and remove saved audio when you no longer need it.
 
 Use a selected WAV in a private evaluation manifest. This example uses the
