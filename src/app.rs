@@ -17,7 +17,7 @@ use crate::{
     dictation_transcript::{DictationTranscript, EmptyTranscript, dictation_transcript},
     domain::{
         DaemonState, DeliveryOutcome, DeliveryStatus, HistoryRecord, StatusSnapshot,
-        TranscriptionStatus, new_session_id,
+        TranscriptionStatus, new_session_id, now_ms,
     },
     error::{AppError, Result},
     history::{HistoryStore, JsonHistoryStore},
@@ -30,6 +30,7 @@ use crate::{
         create_recognizer, execution_provider,
     },
     recorder::{AudioSource, CaptureReport, CpalRecorder, NoopRecorder, Recorder},
+    recordings::{CaptureStatus, Recording, RecordingMetadata, RecordingStore},
 };
 
 struct RecognitionWorker {
@@ -297,6 +298,7 @@ pub struct Daemon {
     delivery: Box<dyn TextSink>,
     history: Box<dyn HistoryStore>,
     notifier: Box<dyn Notifier>,
+    recordings: RecordingStore,
     session_started: Option<Instant>,
 }
 
@@ -309,6 +311,7 @@ impl Daemon {
         delivery: Box<dyn TextSink>,
         history: Box<dyn HistoryStore>,
         notifier: Box<dyn Notifier>,
+        recordings: RecordingStore,
     ) -> Self {
         let status = StatusSnapshot {
             state: DaemonState::Starting,
@@ -330,6 +333,7 @@ impl Daemon {
             delivery,
             history,
             notifier,
+            recordings,
             session_started: None,
         }
     }
@@ -341,6 +345,9 @@ impl Daemon {
     }
 
     pub fn initialize(&mut self) {
+        if let Err(error) = self.recordings.reconcile() {
+            warn!(error = %error, "could not reconcile recent audio recordings");
+        }
         let startup_error = match self.recognizer.as_mut() {
             None => Some("recognizer is not available".to_owned()),
             Some(recognizer) => match recognizer.start_session() {
@@ -477,29 +484,91 @@ impl Daemon {
         self.status.message = "finalizing".to_owned();
         self.safe_notify(NotificationEvent::Finalizing);
 
-        if let Err(error) = self.recorder.stop() {
-            let _ = self.finish_recognition_worker(true);
-            return self.transcription_failure(error.to_string());
-        }
-
-        let recognition = match self
-            .finish_recognition_worker(false)
-            .and_then(|result| result.outcome)
-        {
-            Ok(outcome) => outcome,
-            Err(error) => return self.transcription_failure(error.to_string()),
+        let stop_error = self.recorder.stop().err();
+        let stop_failed = stop_error.is_some();
+        let worker = match self.finish_recognition_worker(stop_failed) {
+            Ok(worker) => worker,
+            Err(error) => {
+                warn!(error = %error, "recognition worker returned no audio; audio was not saved");
+                let reason = stop_error.unwrap_or(error).to_string();
+                let response = self.transcription_failure(reason);
+                return Self::with_recording_warning(
+                    response,
+                    Some("audio was not saved".to_owned()),
+                );
+            }
         };
-
-        let transcript =
-            match dictation_transcript(recognition, &self.config.replacements, self.config.itn) {
-                Ok(DictationTranscript::NoContent) => return self.no_speech(),
-                Ok(DictationTranscript::Ready(transcript)) => transcript,
-                Err(EmptyTranscript) => {
-                    return self.transcription_failure("transcript was empty".to_owned());
+        let transcription = if let Some(error) = stop_error {
+            Err(error.to_string())
+        } else {
+            worker
+                .outcome
+                .map_err(|error| error.to_string())
+                .and_then(|recognition| {
+                    dictation_transcript(recognition, &self.config.replacements, self.config.itn)
+                        .map_err(|EmptyTranscript| "transcript was empty".to_owned())
+                })
+        };
+        let status = match &transcription {
+            Ok(DictationTranscript::NoContent) => TranscriptionStatus::NoSpeech,
+            Ok(DictationTranscript::Ready(_)) => TranscriptionStatus::Succeeded,
+            Err(_) => TranscriptionStatus::Failed,
+        };
+        let recording = Recording {
+            metadata: RecordingMetadata {
+                version: 1,
+                session_id: self
+                    .status
+                    .session_id
+                    .clone()
+                    .expect("listening session ID"),
+                stopped_at_ms: now_ms(),
+                sample_rate: worker.sample_rate,
+                frames: worker.audio.len(),
+                model: self.config.model.clone(),
+                streaming_profile: self.config.streaming_profile.clone(),
+                speech_gate: self.config.speech_gate,
+                denoise: self.config.denoise,
+                itn: self.config.itn,
+                capture: CaptureStatus {
+                    dropped_samples: worker.capture.dropped_samples,
+                    backend_failed: worker.capture.backend_failed,
+                    duration_exceeded: worker.capture.duration_exceeded,
+                    stop_failed,
+                    drain_failed: worker.drain_failed,
+                },
+                transcription: status,
+            },
+            samples: worker.audio,
+        };
+        let warning = match self.recordings.save(&recording) {
+            Ok(saved) => saved.retention_warning.map(|warning| {
+                warn!(path = %saved.path.display(), %warning, "recent audio saved with warning");
+                if warning.contains("retention prune failed") {
+                    format!("old audio could not be pruned; {warning}")
+                } else {
+                    warning
                 }
-            };
+            }),
+            Err(error) => {
+                warn!(error = %error, "audio was not saved");
+                Some("audio was not saved".to_owned())
+            }
+        };
+        let response = match transcription {
+            Ok(DictationTranscript::NoContent) => self.no_speech(),
+            Ok(DictationTranscript::Ready(transcript)) => self.deliver_transcript(transcript),
+            Err(reason) => self.transcription_failure(reason),
+        };
+        Self::with_recording_warning(response, warning)
+    }
 
-        self.deliver_transcript(transcript)
+    fn with_recording_warning(mut response: IpcResponse, warning: Option<String>) -> IpcResponse {
+        if let (IpcResponse::Command { result }, Some(warning)) = (&mut response, warning) {
+            result.message.push_str("; ");
+            result.message.push_str(&warning);
+        }
+        response
     }
 
     fn deliver_transcript(&mut self, transcript: String) -> IpcResponse {
@@ -839,6 +908,7 @@ fn default_daemon(config: Config, paths: &AppPaths) -> Daemon {
         )),
         Box::new(JsonHistoryStore::new(&paths.history_path)),
         Box::new(DesktopNotifier),
+        RecordingStore::new(paths.state_dir.join("recordings")),
     );
     daemon.set_model_status(&model_status);
     daemon
@@ -848,13 +918,32 @@ fn default_daemon(config: Config, paths: &AppPaths) -> Daemon {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
     use super::*;
     use crate::{
         delivery::StaticSink, dictation_transcript::Replacements, history::JsonHistoryStore,
         notifier::NoopNotifier, recorder::TestCapture,
     };
+
+    fn saved_recordings(
+        directory: &TempDir,
+    ) -> Vec<(crate::recordings::RecordingMetadata, crate::audio::Waveform)> {
+        let mut entries: Vec<_> = fs::read_dir(directory.path().join("recordings"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        entries.sort();
+        entries
+            .into_iter()
+            .map(|path| {
+                let metadata =
+                    serde_json::from_slice(&fs::read(path.join("metadata.json")).unwrap()).unwrap();
+                let wave = crate::audio::read_wav(&path.join("audio.wav")).unwrap();
+                (metadata, wave)
+            })
+            .collect()
+    }
 
     #[derive(Default)]
     struct Effects {
@@ -1024,7 +1113,8 @@ mod tests {
         }
     }
 
-    fn observed_daemon(fault: CaptureFault) -> (Daemon, Arc<Mutex<Effects>>) {
+    fn observed_daemon(fault: CaptureFault) -> (Daemon, Arc<Mutex<Effects>>, TempDir) {
+        let directory = tempdir().unwrap();
         let effects = Arc::new(Mutex::new(Effects::default()));
         let mut daemon = Daemon::new(
             Config::default(),
@@ -1036,14 +1126,15 @@ mod tests {
             Box::new(CountingSink(Arc::clone(&effects))),
             Box::new(CountingHistory(Arc::clone(&effects))),
             Box::new(NoopNotifier::default()),
+            RecordingStore::new(directory.path().join("recordings")),
         );
         daemon.initialize();
-        (daemon, effects)
+        (daemon, effects, directory)
     }
 
     #[test]
     fn protected_technical_text_is_delivered_once_and_stored_exactly() {
-        let (mut daemon, effects) = observed_daemon(CaptureFault::None);
+        let (mut daemon, effects, _directory) = observed_daemon(CaptureFault::None);
         daemon.recognizer = Some(Box::new(StaticRecognizer::new("um ER diagram in C++.")));
         assert!(daemon.handle(IpcRequest::Toggle).is_ok());
         assert!(effects.lock().unwrap().sent.is_empty());
@@ -1056,8 +1147,9 @@ mod tests {
 
     #[test]
     fn successful_stop_delivers_once_and_only_after_stop() {
-        let (mut daemon, effects) = observed_daemon(CaptureFault::None);
+        let (mut daemon, effects, directory) = observed_daemon(CaptureFault::None);
         assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        let session_id = daemon.status.session_id.clone().unwrap();
         {
             let effects = effects.lock().unwrap();
             assert!(effects.sent.is_empty());
@@ -1070,12 +1162,37 @@ mod tests {
         assert_eq!(effects.records.len(), 1);
         assert_eq!(effects.records[0].transcript, "final transcript");
         assert_eq!(effects.delivery_updates, 1);
+        let saved = saved_recordings(&directory);
+        assert_eq!(saved.len(), 1);
+        let (metadata, wave) = &saved[0];
+        assert_eq!(metadata.version, 1);
+        assert_eq!(metadata.session_id, session_id);
+        assert!(metadata.stopped_at_ms > 0);
+        assert_eq!(metadata.sample_rate, 16_000);
+        assert_eq!(metadata.frames, 1);
+        assert_eq!(metadata.model, daemon.config.model);
+        assert_eq!(metadata.streaming_profile, daemon.config.streaming_profile);
+        assert_eq!(metadata.speech_gate, daemon.config.speech_gate);
+        assert_eq!(metadata.denoise, daemon.config.denoise);
+        assert_eq!(metadata.itn, daemon.config.itn);
+        assert_eq!(metadata.transcription, TranscriptionStatus::Succeeded);
+        assert_eq!(metadata.capture.dropped_samples, 0);
+        assert!(!metadata.capture.backend_failed);
+        assert!(!metadata.capture.duration_exceeded);
+        assert!(!metadata.capture.stop_failed);
+        assert!(!metadata.capture.drain_failed);
+        assert_eq!(wave.sample_rate, 16_000);
+        assert_eq!(wave.samples, [0.25]);
     }
 
     #[test]
     fn capture_failures_do_not_deliver_or_append_history_and_recover() {
-        for fault in [CaptureFault::Queue, CaptureFault::Backend, CaptureFault::Both] {
-            let (mut daemon, effects) = observed_daemon(fault);
+        for fault in [
+            CaptureFault::Queue,
+            CaptureFault::Backend,
+            CaptureFault::Both,
+        ] {
+            let (mut daemon, effects, directory) = observed_daemon(fault);
             assert!(daemon.handle(IpcRequest::Toggle).is_ok());
             let response = daemon.handle(IpcRequest::Toggle);
             let IpcResponse::Command { result } = response else {
@@ -1092,8 +1209,23 @@ mod tests {
                 assert!(effects.records.is_empty());
                 assert_eq!(effects.delivery_updates, 0);
             }
+            let saved = saved_recordings(&directory);
+            assert_eq!(saved.len(), 1);
+            let (metadata, wave) = &saved[0];
+            assert_eq!(metadata.transcription, TranscriptionStatus::Failed);
+            assert_eq!(
+                metadata.capture.backend_failed,
+                matches!(fault, CaptureFault::Backend | CaptureFault::Both)
+            );
+            assert_eq!(
+                metadata.capture.dropped_samples > 0,
+                matches!(fault, CaptureFault::Queue | CaptureFault::Both)
+            );
+            assert_eq!(metadata.frames, wave.samples.len());
+            assert_eq!(wave.sample_rate, 16_000);
             assert!(daemon.handle(IpcRequest::Toggle).is_ok());
             assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+            assert_eq!(saved_recordings(&directory).len(), 2);
             let effects = effects.lock().unwrap();
             assert_eq!(effects.sent, vec!["final transcript"]);
             assert_eq!(effects.records.len(), 1);
@@ -1124,12 +1256,18 @@ mod tests {
 
             fn accept_audio(&mut self, rate: i32, samples: &[f32]) -> Result<()> {
                 assert_eq!(rate, MODEL_SAMPLE_RATE);
-                self.calls.lock().unwrap().samples.extend_from_slice(samples);
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .samples
+                    .extend_from_slice(samples);
                 if let Some((entered, resume)) = self.first_audio.take() {
                     entered.send(()).unwrap();
                     resume.recv_timeout(Duration::from_secs(5)).unwrap();
                     if self.fail_first_audio {
-                        return Err(AppError::Unavailable("earlier recognizer failure".to_owned()));
+                        return Err(AppError::Unavailable(
+                            "earlier recognizer failure".to_owned(),
+                        ));
                     }
                 }
                 Ok(())
@@ -1137,7 +1275,9 @@ mod tests {
 
             fn finish_session(&mut self) -> Result<RecognitionOutcome> {
                 self.calls.lock().unwrap().finishes += 1;
-                Ok(RecognitionOutcome::Transcript("final transcript".to_owned()))
+                Ok(RecognitionOutcome::Transcript(
+                    "final transcript".to_owned(),
+                ))
             }
 
             fn cancel_session(&mut self) -> Result<()> {
@@ -1154,7 +1294,7 @@ mod tests {
             let (stop_tx, stop_rx) = mpsc::channel();
             let (finish_tx, finish_rx) = mpsc::channel();
             let calls = Arc::new(Mutex::new(Calls::default()));
-            let (mut daemon, effects) = observed_daemon(CaptureFault::None);
+            let (mut daemon, effects, directory) = observed_daemon(CaptureFault::None);
             daemon.config.denoise = false;
             daemon.recorder = Box::new(ThreadedRecorder {
                 source: None,
@@ -1170,8 +1310,12 @@ mod tests {
             assert!(daemon.handle(IpcRequest::Toggle).is_ok());
             daemon.worker.as_mut().unwrap().finish_sent = Some(finish_tx);
             // Bounded receives are deadlock guards, not elapsed-time assertions.
-            callback_entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            audio_entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            callback_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            audio_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
             {
                 let effects = effects.lock().unwrap();
                 assert!(effects.sent.is_empty());
@@ -1208,6 +1352,12 @@ mod tests {
             assert!(result.message.contains("backend capture error"));
             assert!(!result.message.contains("mono samples dropped"));
             assert!(!result.message.contains("earlier recognizer failure"));
+            let saved = saved_recordings(&directory);
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].0.transcription, TranscriptionStatus::Failed);
+            assert!(saved[0].0.capture.backend_failed);
+            assert_eq!(saved[0].0.frames, 2);
+            assert_eq!(saved[0].1.samples, [0.25, 0.5]);
             {
                 let calls = calls.lock().unwrap();
                 assert_eq!(calls.samples, vec![0.25]);
@@ -1234,9 +1384,10 @@ mod tests {
 
     #[test]
     fn cancel_with_a_full_queue_has_no_effects_and_recovers() {
-        let (mut daemon, effects) = observed_daemon(CaptureFault::Queue);
+        let (mut daemon, effects, directory) = observed_daemon(CaptureFault::Queue);
         assert!(daemon.handle(IpcRequest::Toggle).is_ok());
         assert!(daemon.handle(IpcRequest::Cancel).is_ok());
+        assert!(saved_recordings(&directory).is_empty());
         {
             let effects = effects.lock().unwrap();
             assert!(effects.sent.is_empty());
@@ -1253,7 +1404,7 @@ mod tests {
 
     #[test]
     fn recorder_stop_error_never_reaches_history_or_delivery() {
-        let (mut daemon, effects) = observed_daemon(CaptureFault::None);
+        let (mut daemon, effects, directory) = observed_daemon(CaptureFault::None);
         daemon.recorder = Box::new(StopErrorRecorder(FixtureRecorder {
             fault: CaptureFault::None,
             session: None,
@@ -1267,6 +1418,12 @@ mod tests {
         assert_eq!(result.delivery, DeliveryStatus::NotAttempted);
         assert_eq!(result.status.state, DaemonState::Idle);
         assert!(result.transcript.is_none());
+        assert!(result.message.contains("injected backend capture error"));
+        let saved = saved_recordings(&directory);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].0.transcription, TranscriptionStatus::Failed);
+        assert!(saved[0].0.capture.stop_failed);
+        assert_eq!(saved[0].1.samples, [0.25]);
         let effects = effects.lock().unwrap();
         assert!(effects.sent.is_empty());
         assert!(effects.records.is_empty());
@@ -1353,25 +1510,24 @@ mod tests {
         }
     }
 
-    fn test_daemon(outcome: DeliveryOutcome) -> Daemon {
+    fn test_daemon(outcome: DeliveryOutcome) -> (Daemon, TempDir) {
         let directory = tempdir().expect("temp directory");
         let history = Box::new(JsonHistoryStore::new(directory.path().join("history.json")));
-        // Leak the temporary directory for the duration of this unit test so
-        // the history path remains valid while the daemon owns it.
-        std::mem::forget(directory);
-        Daemon::new(
+        let daemon = Daemon::new(
             Config::default(),
             Box::new(NoopRecorder::default()),
             Box::new(StaticRecognizer::new("final transcript")),
             Box::new(StaticSink::new(outcome)),
             history,
             Box::new(NoopNotifier::default()),
-        )
+            RecordingStore::new(directory.path().join("recordings")),
+        );
+        (daemon, directory)
     }
 
     #[test]
     fn final_only_delivery_keeps_transcript_in_history() {
-        let mut daemon = test_daemon(DeliveryOutcome::Delivered {
+        let (mut daemon, _directory) = test_daemon(DeliveryOutcome::Delivered {
             backend: "test".to_owned(),
         });
         daemon.initialize();
@@ -1393,7 +1549,7 @@ mod tests {
 
     #[test]
     fn failed_delivery_still_reports_transcription_success() {
-        let mut daemon = test_daemon(DeliveryOutcome::Failed {
+        let (mut daemon, _directory) = test_daemon(DeliveryOutcome::Failed {
             reason: "no input backend".to_owned(),
         });
         daemon.initialize();
@@ -1424,6 +1580,7 @@ mod tests {
             })),
             Box::new(JsonHistoryStore::new(&history_path)),
             Box::new(NoopNotifier::default()),
+            RecordingStore::new(directory.path().join("recordings")),
         );
         daemon.initialize();
         let _ = daemon.handle(IpcRequest::Toggle);
@@ -1445,7 +1602,7 @@ mod tests {
 
     #[test]
     fn short_stutters_are_collapsed_before_history_and_delivery() {
-        let mut daemon = test_daemon(DeliveryOutcome::Delivered {
+        let (mut daemon, _directory) = test_daemon(DeliveryOutcome::Delivered {
             backend: "test".to_owned(),
         });
         daemon.recognizer = Some(Box::new(StaticRecognizer::new("I I I I think")));
@@ -1477,6 +1634,7 @@ mod tests {
             })),
             Box::new(JsonHistoryStore::new(&history_path)),
             Box::new(NoopNotifier::default()),
+            RecordingStore::new(directory.path().join("recordings")),
         );
         daemon.initialize();
         let _ = daemon.handle(IpcRequest::Toggle);
@@ -1502,6 +1660,7 @@ mod tests {
             })),
             Box::new(JsonHistoryStore::new(&history_path)),
             Box::new(NoopNotifier::default()),
+            RecordingStore::new(directory.path().join("recordings")),
         );
         daemon.initialize();
         let _ = daemon.handle(IpcRequest::Toggle);
@@ -1531,6 +1690,7 @@ mod tests {
             })),
             Box::new(JsonHistoryStore::new(&history_path)),
             Box::new(NoopNotifier::default()),
+            RecordingStore::new(directory.path().join("recordings")),
         );
         daemon.initialize();
         let _ = daemon.handle(IpcRequest::Toggle);
@@ -1566,6 +1726,7 @@ mod tests {
             })),
             Box::new(JsonHistoryStore::new(&history_path)),
             Box::new(NoopNotifier::default()),
+            RecordingStore::new(directory.path().join("recordings")),
         );
         daemon.initialize();
         let _ = daemon.handle(IpcRequest::Toggle);
@@ -1586,6 +1747,218 @@ mod tests {
                 .expect("list history")
                 .is_empty()
         );
+        let saved_entries = saved_recordings(&directory);
+        assert_eq!(saved_entries.len(), 1);
+        let (metadata, wave) = &saved_entries[0];
+        assert_eq!(metadata.transcription, TranscriptionStatus::NoSpeech);
+        assert_eq!(metadata.frames, 0);
+        assert!(wave.samples.is_empty());
+        assert_eq!(wave.sample_rate, 16_000);
+    }
+
+    #[test]
+    fn empty_transcript_still_saves_failed_attempt() {
+        let (mut daemon, effects, directory) = observed_daemon(CaptureFault::None);
+        daemon.recognizer = Some(Box::new(StaticRecognizer::new("  ")));
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        let IpcResponse::Command { result } = daemon.handle(IpcRequest::Toggle) else {
+            panic!("command")
+        };
+        assert!(!result.ok);
+        assert_eq!(result.transcription, TranscriptionStatus::Failed);
+        assert!(result.message.contains("transcript was empty"));
+        assert_eq!(result.delivery, DeliveryStatus::NotAttempted);
+        assert!(effects.lock().unwrap().records.is_empty());
+        let saved = saved_recordings(&directory);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].0.transcription, TranscriptionStatus::Failed);
+        assert_eq!(saved[0].1.samples, [0.25]);
+    }
+
+    #[test]
+    fn recognizer_failure_saves_raw_audio_without_delivery() {
+        struct FailingRecognizer;
+        impl StreamingRecognizer for FailingRecognizer {
+            fn start_session(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn accept_audio(&mut self, _: i32, _: &[f32]) -> Result<()> {
+                Ok(())
+            }
+            fn finish_session(&mut self) -> Result<RecognitionOutcome> {
+                Err(AppError::Unavailable("decode failed".into()))
+            }
+            fn cancel_session(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let (mut daemon, effects, directory) = observed_daemon(CaptureFault::None);
+        daemon.recognizer = Some(Box::new(FailingRecognizer));
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        let IpcResponse::Command { result } = daemon.handle(IpcRequest::Toggle) else {
+            panic!("command")
+        };
+        assert!(!result.ok);
+        assert_eq!(result.transcription, TranscriptionStatus::Failed);
+        assert!(result.message.contains("decode failed"));
+        assert_eq!(result.delivery, DeliveryStatus::NotAttempted);
+        assert!(effects.lock().unwrap().records.is_empty());
+        let saved = saved_recordings(&directory);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].0.transcription, TranscriptionStatus::Failed);
+        assert_eq!(saved[0].1.samples, [0.25]);
+    }
+
+    #[test]
+    fn worker_panic_warns_without_creating_a_misleading_wav() {
+        struct PanickingRecognizer;
+        impl StreamingRecognizer for PanickingRecognizer {
+            fn start_session(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn accept_audio(&mut self, _: i32, _: &[f32]) -> Result<()> {
+                Ok(())
+            }
+            fn finish_session(&mut self) -> Result<RecognitionOutcome> {
+                panic!("decode panic")
+            }
+            fn cancel_session(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let (mut daemon, effects, directory) = observed_daemon(CaptureFault::None);
+        daemon.recognizer = Some(Box::new(PanickingRecognizer));
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        let IpcResponse::Command { result } = daemon.handle(IpcRequest::Toggle) else {
+            panic!("command")
+        };
+        assert!(!result.ok);
+        assert_eq!(result.transcription, TranscriptionStatus::Failed);
+        assert!(result.message.contains("recognition worker panicked"));
+        assert!(result.message.contains("audio was not saved"));
+        assert!(saved_recordings(&directory).is_empty());
+        assert!(effects.lock().unwrap().records.is_empty());
+    }
+
+    #[test]
+    fn initialize_reconciles_staging_without_blocking_dictation() {
+        let (mut daemon, directory) = test_daemon(DeliveryOutcome::Delivered {
+            backend: "test".to_owned(),
+        });
+        let staging = directory.path().join("recordings/.staging-1700000000000-1");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("audio.wav"), b"partial").unwrap();
+        daemon.initialize();
+        assert!(!staging.exists());
+        assert_eq!(daemon.status.state, DaemonState::Idle);
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        assert_eq!(saved_recordings(&directory).len(), 1);
+    }
+
+    #[test]
+    fn failed_start_does_not_save_audio() {
+        let (mut daemon, _effects, directory) = observed_daemon(CaptureFault::None);
+        daemon.recognizer = Some(Box::new(UnavailableRecognizer::new("start failed")));
+        let IpcResponse::Command { result } = daemon.handle(IpcRequest::Toggle) else {
+            panic!("command")
+        };
+        assert!(!result.ok);
+        assert_eq!(result.transcription, TranscriptionStatus::NotStarted);
+        assert!(saved_recordings(&directory).is_empty());
+    }
+
+    #[test]
+    fn recorder_start_failure_does_not_save_audio() {
+        struct StartErrorRecorder;
+        impl Recorder for StartErrorRecorder {
+            fn start(&mut self) -> Result<()> {
+                Err(AppError::Unavailable("recorder start failed".into()))
+            }
+            fn stop(&mut self) -> Result<()> {
+                panic!("no active capture")
+            }
+            fn cancel(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn audio_source(&mut self) -> Result<AudioSource> {
+                panic!("no active capture")
+            }
+        }
+        let (mut daemon, _effects, directory) = observed_daemon(CaptureFault::None);
+        daemon.recorder = Box::new(StartErrorRecorder);
+        let IpcResponse::Command { result } = daemon.handle(IpcRequest::Toggle) else {
+            panic!("command")
+        };
+        assert!(!result.ok);
+        assert_eq!(result.transcription, TranscriptionStatus::NotStarted);
+        assert!(saved_recordings(&directory).is_empty());
+    }
+
+    #[test]
+    fn saving_failure_preserves_transcription_delivery_and_history() {
+        let (mut daemon, effects, directory) = observed_daemon(CaptureFault::None);
+        let root = directory.path().join("blocked-recordings");
+        fs::write(&root, b"keep").unwrap();
+        daemon.recordings = RecordingStore::new(root.clone());
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        let IpcResponse::Command { result } = daemon.handle(IpcRequest::Toggle) else {
+            panic!("command")
+        };
+        assert!(result.ok);
+        assert_eq!(result.transcription, TranscriptionStatus::Succeeded);
+        assert_eq!(result.delivery, DeliveryStatus::Delivered);
+        assert_eq!(result.transcript.as_deref(), Some("final transcript"));
+        assert!(result.message.contains("audio was not saved"));
+        assert_eq!(fs::read(root).unwrap(), b"keep");
+        let effects = effects.lock().unwrap();
+        assert_eq!(effects.records.len(), 1);
+        assert_eq!(effects.sent, ["final transcript"]);
+        assert_eq!(effects.delivery_updates, 1);
+    }
+
+    #[test]
+    fn saving_failure_does_not_change_no_speech_or_delivery_failure() {
+        for (recognizer, delivery, status, ok) in [
+            (
+                StaticRecognizer::no_speech(),
+                DeliveryOutcome::Delivered {
+                    backend: "test".into(),
+                },
+                TranscriptionStatus::NoSpeech,
+                true,
+            ),
+            (
+                StaticRecognizer::new("text"),
+                DeliveryOutcome::Failed {
+                    reason: "sink failed".into(),
+                },
+                TranscriptionStatus::Succeeded,
+                false,
+            ),
+        ] {
+            let (mut daemon, directory) = test_daemon(delivery);
+            daemon.recognizer = Some(Box::new(recognizer));
+            let root = directory.path().join("blocked-recordings");
+            fs::write(&root, b"keep").unwrap();
+            daemon.recordings = RecordingStore::new(root);
+            daemon.initialize();
+            assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+            let IpcResponse::Command { result } = daemon.handle(IpcRequest::Toggle) else {
+                panic!("command")
+            };
+            assert_eq!(result.ok, ok);
+            assert_eq!(result.transcription, status);
+            assert_eq!(
+                result.delivery,
+                if ok {
+                    DeliveryStatus::NotAttempted
+                } else {
+                    DeliveryStatus::Failed
+                }
+            );
+            assert!(result.message.contains("audio was not saved"));
+        }
     }
 
     #[test]
@@ -1755,6 +2128,7 @@ mod tests {
             })),
             Box::new(JsonHistoryStore::new(directory.path().join("history.json"))),
             Box::new(NoopNotifier::default()),
+            RecordingStore::new(directory.path().join("recordings")),
         );
         daemon.initialize();
         let _ = daemon.handle(IpcRequest::Toggle);
