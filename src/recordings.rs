@@ -55,6 +55,10 @@ pub struct RecordingStore {
     #[cfg(test)]
     fail_after_wav: bool,
     #[cfg(test)]
+    fail_staging_dir_sync: bool,
+    #[cfg(test)]
+    fail_root_dir_sync: bool,
+    #[cfg(test)]
     fail_prune: bool,
 }
 
@@ -64,6 +68,10 @@ impl RecordingStore {
             root,
             #[cfg(test)]
             fail_after_wav: false,
+            #[cfg(test)]
+            fail_staging_dir_sync: false,
+            #[cfg(test)]
+            fail_root_dir_sync: false,
             #[cfg(test)]
             fail_prune: false,
         }
@@ -119,6 +127,13 @@ impl RecordingStore {
             let mut json = private_file(&staging.join("metadata.json"))?;
             json.write_all(&payload)?;
             json.sync_all()?;
+            #[cfg(test)]
+            if self.fail_staging_dir_sync {
+                return Err(AppError::Unavailable(
+                    "injected staging directory sync failure".into(),
+                ));
+            }
+            File::open(&staging)?.sync_all()?;
             fs::rename(&staging, &path)?;
             Ok(())
         })();
@@ -127,12 +142,27 @@ impl RecordingStore {
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
-        let retention_warning = self.prune().err().map(|error| {
-            format!("recording saved, but retention prune failed; retry on startup: {error}")
-        });
+        let mut warnings = Vec::new();
+        let root_sync = (|| -> Result<()> {
+            #[cfg(test)]
+            if self.fail_root_dir_sync {
+                return Err(AppError::Unavailable(
+                    "injected root directory sync failure".into(),
+                ));
+            }
+            File::open(&self.root)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = root_sync {
+            warnings.push(format!("directory sync failed: {error}"));
+        }
+        if let Err(error) = self.prune() {
+            warnings.push(format!("retention prune failed; retry on startup: {error}"));
+        }
         Ok(SaveOutcome {
             path,
-            retention_warning,
+            retention_warning: (!warnings.is_empty())
+                .then(|| format!("recording saved, but {}", warnings.join("; "))),
         })
     }
 
@@ -153,14 +183,27 @@ impl RecordingStore {
     }
 
     fn prepare_root(&self) -> Result<()> {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.root)?;
-        if !fs::symlink_metadata(&self.root)?.file_type().is_dir() {
-            return Err(AppError::Unavailable(
-                "recording root is not a directory".into(),
-            ));
+        // The caller owns the state-home path. Only nvstt and its children are
+        // store-managed; a symlink in state-home itself is allowed.
+        let managed = self
+            .root
+            .ancestors()
+            .find(|path| path.file_name().is_some_and(|name| name == "nvstt"))
+            .unwrap_or(&self.root);
+        if let Some(parent) = managed
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        let mut path = managed.to_path_buf();
+        ensure_real_directory(&path)?;
+        for component in self.root.strip_prefix(managed).unwrap().components() {
+            path.push(component);
+            ensure_real_directory(&path)?;
         }
         fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))?;
         Ok(())
@@ -213,6 +256,21 @@ impl RecordingStore {
         }
         owned.sort_by(|a, b| (a.1, &a.2).cmp(&(b.1, &b.2)));
         Ok(owned)
+    }
+}
+
+fn ensure_real_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(AppError::Unavailable(format!(
+            "recording store path is not a real directory: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            DirBuilder::new().mode(0o700).create(path)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -427,6 +485,77 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fs::read(root).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn symlinked_nvstt_cannot_redirect_save_or_reconciliation() {
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&state).unwrap();
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, state.join("nvstt")).unwrap();
+        let root = state.join("nvstt/recordings");
+        let store = RecordingStore::new(root);
+        assert!(store.save(&fixture(0, &[0.125])).is_err());
+        assert!(!outside.join("recordings").exists());
+
+        let redirected = outside.join("recordings");
+        fs::create_dir(&redirected).unwrap();
+        let staging = redirected.join(".staging-1700000000000-99");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("audio.wav"), b"keep").unwrap();
+        assert!(store.reconcile().is_err());
+        assert_eq!(fs::read(staging.join("audio.wav")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn symlinked_xdg_state_home_can_still_hold_recordings() {
+        let dir = tempdir().unwrap();
+        let actual = dir.path().join("actual-state");
+        fs::create_dir(&actual).unwrap();
+        let state = dir.path().join("state-link");
+        std::os::unix::fs::symlink(&actual, &state).unwrap();
+        let store = RecordingStore::new(state.join("nvstt/recordings"));
+        let saved = store.save(&fixture(0, &[0.125])).unwrap();
+        assert!(saved.path.join("audio.wav").is_file());
+        store.reconcile().unwrap();
+    }
+
+    #[test]
+    fn staging_directory_sync_failure_does_not_publish_or_prune() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("recordings");
+        let mut store = RecordingStore::new(root.clone());
+        for n in 0..7 {
+            store.save(&fixture(n, &[0.125])).unwrap();
+        }
+        store.fail_staging_dir_sync = true;
+        assert!(store.save(&fixture(7, &[0.125])).is_err());
+        assert_eq!(entries(&root).len(), 7);
+        assert!(
+            !entries(&root).iter().any(|p| p
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-7"))
+        );
+    }
+
+    #[test]
+    fn published_root_sync_failure_reports_saved_path_and_warning() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("recordings");
+        let mut store = RecordingStore::new(root.clone());
+        store.fail_root_dir_sync = true;
+        let outcome = store.save(&fixture(0, &[0.125])).unwrap();
+        assert!(outcome.path.join("audio.wav").is_file());
+        assert!(
+            outcome
+                .retention_warning
+                .unwrap()
+                .contains("directory sync")
+        );
     }
 
     #[test]
