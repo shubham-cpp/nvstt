@@ -1,6 +1,10 @@
 //! Small dependency-free WAV reader and writer.
 
-use std::{fs, io::Write, path::Path};
+use std::{
+    fs,
+    io::{BufWriter, Write},
+    path::Path,
+};
 
 use crate::error::{AppError, Result};
 
@@ -28,6 +32,7 @@ pub(crate) fn write_float_wav(
         .filter(|rate| *rate > 0)
         .ok_or_else(|| AppError::Unavailable("invalid WAV sample rate".into()))?;
 
+    let mut writer = BufWriter::new(writer);
     writer.write_all(b"RIFF")?;
     writer.write_all(&(48 + data_bytes).to_le_bytes())?;
     writer.write_all(b"WAVEfmt ")?;
@@ -46,6 +51,7 @@ pub(crate) fn write_float_wav(
     for sample in samples {
         writer.write_all(&sample.to_le_bytes())?;
     }
+    writer.flush()?;
     Ok(())
 }
 
@@ -153,6 +159,53 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn float_wav_batches_sample_writes() {
+        struct CountingWriter {
+            bytes: Vec<u8>,
+            writes: usize,
+        }
+
+        impl Write for CountingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = CountingWriter {
+            bytes: Vec::new(),
+            writes: 0,
+        };
+        write_float_wav(&mut writer, 48_000, &vec![0.125; 20_000]).unwrap();
+        assert_eq!(writer.bytes.len(), 56 + 20_000 * 4);
+        assert!(writer.writes < 32, "{} underlying writes", writer.writes);
+    }
+
+    #[test]
+    fn float_wav_reports_flush_failure() {
+        struct FlushFails(Vec<u8>);
+
+        impl Write for FlushFails {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("flush failed"))
+            }
+        }
+
+        let mut writer = FlushFails(Vec::new());
+        assert!(write_float_wav(&mut writer, 48_000, &[0.125]).is_err());
+    }
 
     #[test]
     fn float_wav_keeps_boundary_samples_and_rate() {
