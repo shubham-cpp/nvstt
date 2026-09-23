@@ -29,7 +29,7 @@ use crate::{
         RecognitionOutcome, StaticRecognizer, StreamingRecognizer, UnavailableRecognizer,
         create_recognizer, execution_provider,
     },
-    recorder::{AudioSource, CpalRecorder, NoopRecorder, Recorder},
+    recorder::{AudioSource, CaptureReport, CpalRecorder, NoopRecorder, Recorder},
 };
 
 struct RecognitionWorker {
@@ -41,13 +41,21 @@ struct RecognitionWorker {
 }
 
 enum WorkerCommand {
-    Finish,
+    Finish { capture_only: bool },
     Cancel,
+}
+
+struct WorkerResult {
+    audio: Vec<f32>,
+    sample_rate: i32,
+    capture: CaptureReport,
+    drain_failed: bool,
+    outcome: Result<RecognitionOutcome>,
 }
 
 struct WorkerCompletion {
     recognizer: Box<dyn StreamingRecognizer>,
-    outcome: Option<Result<RecognitionOutcome>>,
+    result: Option<WorkerResult>,
 }
 
 impl RecognitionWorker {
@@ -75,10 +83,15 @@ impl RecognitionWorker {
         })
     }
 
-    fn finish(mut self) -> Result<(Box<dyn StreamingRecognizer>, Result<RecognitionOutcome>)> {
-        self.command_tx.send(WorkerCommand::Finish).map_err(|_| {
-            AppError::Unavailable("recognition worker stopped unexpectedly".to_owned())
-        })?;
+    fn finish(
+        mut self,
+        capture_only: bool,
+    ) -> Result<(Box<dyn StreamingRecognizer>, WorkerResult)> {
+        self.command_tx
+            .send(WorkerCommand::Finish { capture_only })
+            .map_err(|_| {
+                AppError::Unavailable("recognition worker stopped unexpectedly".to_owned())
+            })?;
         #[cfg(test)]
         if let Some(sent) = self.finish_sent.take() {
             sent.send(()).expect("notify test that Finish is queued");
@@ -92,12 +105,10 @@ impl RecognitionWorker {
         let completion = self.completion_rx.recv().map_err(|_| {
             AppError::Unavailable("recognition worker returned no result".to_owned())
         })?;
-        let outcome = completion.outcome.unwrap_or_else(|| {
-            Err(AppError::Unavailable(
-                "recognition worker canceled".to_owned(),
-            ))
-        });
-        Ok((completion.recognizer, outcome))
+        let result = completion
+            .result
+            .ok_or_else(|| AppError::Unavailable("recognition worker canceled".to_owned()))?;
+        Ok((completion.recognizer, result))
     }
 
     fn cancel(mut self) -> Result<Box<dyn StreamingRecognizer>> {
@@ -126,21 +137,31 @@ fn run_recognition_worker(
 ) {
     let mut audio_pipeline = AudioPipeline::new(denoise);
     let mut worker_error: Option<AppError> = None;
-    let outcome = loop {
-        feed_audio_if_healthy(
-            &mut source,
-            recognizer.as_mut(),
-            &mut audio_pipeline,
-            &mut worker_error,
-        );
+    let mut audio = Vec::new();
+    let mut drain_failed = false;
+    let result = loop {
+        if !drain_failed {
+            feed_available_audio(
+                &mut source,
+                recognizer.as_mut(),
+                &mut audio_pipeline,
+                &mut audio,
+                &mut worker_error,
+                &mut drain_failed,
+                true,
+            );
+        }
 
         match command_rx.recv_timeout(Duration::from_millis(20)) {
-            Ok(WorkerCommand::Finish) => {
+            Ok(WorkerCommand::Finish { capture_only }) => {
                 break Some(finish_worker_session(
                     &mut source,
                     recognizer.as_mut(),
                     &mut audio_pipeline,
-                    worker_error.take(),
+                    audio,
+                    worker_error,
+                    drain_failed,
+                    capture_only,
                 ));
             }
             Ok(WorkerCommand::Cancel) => {
@@ -149,86 +170,109 @@ fn run_recognition_worker(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let error =
-                    AppError::Unavailable("recognition worker command channel closed".to_owned());
-                break Some(Err(error));
+                let _ = recognizer.cancel_session();
+                break Some(WorkerResult {
+                    audio,
+                    sample_rate: source.sample_rate(),
+                    capture: source.capture_report(),
+                    drain_failed,
+                    outcome: Err(AppError::Unavailable(
+                        "recognition worker command channel closed".to_owned(),
+                    )),
+                });
             }
         }
     };
 
-    let _ = completion_tx.send(WorkerCompletion {
-        recognizer,
-        outcome,
-    });
+    let _ = completion_tx.send(WorkerCompletion { recognizer, result });
 }
 
-fn feed_audio_if_healthy(
+// Returns true when the current queue snapshot is empty or the source has failed.
+fn feed_available_audio(
     source: &mut AudioSource,
     recognizer: &mut dyn StreamingRecognizer,
     audio_pipeline: &mut AudioPipeline,
+    audio: &mut Vec<f32>,
     worker_error: &mut Option<AppError>,
-) {
-    if worker_error.is_none() {
-        *worker_error = feed_available_audio(source, recognizer, audio_pipeline).err();
+    drain_failed: &mut bool,
+    recognize: bool,
+) -> bool {
+    let samples = match source.drain() {
+        Ok(samples) => samples,
+        Err(error) => {
+            *drain_failed = true;
+            if worker_error.is_none() {
+                *worker_error = Some(error);
+            }
+            return true;
+        }
+    };
+    if samples.is_empty() {
+        return true;
     }
+    audio.extend_from_slice(&samples);
+    if recognize && worker_error.is_none() {
+        *worker_error =
+            feed_recognizer(recognizer, audio_pipeline, source.sample_rate(), &samples).err();
+    }
+    false
 }
 
 fn finish_worker_session(
     source: &mut AudioSource,
     recognizer: &mut dyn StreamingRecognizer,
     audio_pipeline: &mut AudioPipeline,
-    worker_error: Option<AppError>,
-) -> Result<RecognitionOutcome> {
-    if let Err(error) = source.integrity_result() {
+    mut audio: Vec<f32>,
+    mut worker_error: Option<AppError>,
+    mut drain_failed: bool,
+    capture_only: bool,
+) -> WorkerResult {
+    let pending_start = audio.len();
+    while !drain_failed
+        && !feed_available_audio(
+            source,
+            recognizer,
+            audio_pipeline,
+            &mut audio,
+            &mut worker_error,
+            &mut drain_failed,
+            false,
+        )
+    {}
+
+    let outcome = if let Err(error) = source.integrity_result() {
         let _ = recognizer.cancel_session();
-        return Err(error);
-    }
-    if let Some(error) = worker_error {
+        Err(error)
+    } else if capture_only {
         let _ = recognizer.cancel_session();
-        return Err(error);
+        Err(AppError::Unavailable(
+            "recognition worker capture only".to_owned(),
+        ))
+    } else if let Some(error) = worker_error {
+        let _ = recognizer.cancel_session();
+        Err(error)
+    } else {
+        feed_recognizer(
+            recognizer,
+            audio_pipeline,
+            source.sample_rate(),
+            &audio[pending_start..],
+        )
+        .and_then(|()| audio_pipeline.finish())
+        .and_then(|samples| {
+            if !samples.is_empty() {
+                recognizer.accept_audio(MODEL_SAMPLE_RATE, &samples)?;
+            }
+            recognizer.finish_session()
+        })
+    };
+    WorkerResult {
+        audio,
+        sample_rate: source.sample_rate(),
+        capture: source.capture_report(),
+        drain_failed,
+        outcome,
     }
-    finish_audio(source, recognizer, audio_pipeline)?;
-    recognizer.finish_session()
-}
-
-fn feed_available_audio(
-    source: &mut AudioSource,
-    recognizer: &mut dyn StreamingRecognizer,
-    audio_pipeline: &mut AudioPipeline,
-) -> Result<()> {
-    let samples = source.drain()?;
-    if samples.is_empty() {
-        return Ok(());
-    }
-    feed_recognizer(recognizer, audio_pipeline, source.sample_rate(), &samples)
-}
-
-fn drain_audio(
-    source: &mut AudioSource,
-    recognizer: &mut dyn StreamingRecognizer,
-    audio_pipeline: &mut AudioPipeline,
-) -> Result<()> {
-    loop {
-        let samples = source.drain()?;
-        if samples.is_empty() {
-            return Ok(());
-        }
-        feed_recognizer(recognizer, audio_pipeline, source.sample_rate(), &samples)?;
-    }
-}
-
-fn finish_audio(
-    source: &mut AudioSource,
-    recognizer: &mut dyn StreamingRecognizer,
-    audio_pipeline: &mut AudioPipeline,
-) -> Result<()> {
-    drain_audio(source, recognizer, audio_pipeline)?;
-    let samples = audio_pipeline.finish()?;
-    if !samples.is_empty() {
-        recognizer.accept_audio(MODEL_SAMPLE_RATE, &samples)?;
-    }
-    source.integrity_result()?;
-    Ok(())
 }
 
 fn feed_recognizer(
@@ -434,10 +478,14 @@ impl Daemon {
         self.safe_notify(NotificationEvent::Finalizing);
 
         if let Err(error) = self.recorder.stop() {
+            let _ = self.finish_recognition_worker(true);
             return self.transcription_failure(error.to_string());
         }
 
-        let recognition = match self.finish_recognition_worker() {
+        let recognition = match self
+            .finish_recognition_worker(false)
+            .and_then(|result| result.outcome)
+        {
             Ok(outcome) => outcome,
             Err(error) => return self.transcription_failure(error.to_string()),
         };
@@ -596,13 +644,13 @@ impl Daemon {
         )
     }
 
-    fn finish_recognition_worker(&mut self) -> Result<RecognitionOutcome> {
+    fn finish_recognition_worker(&mut self, capture_only: bool) -> Result<WorkerResult> {
         let worker = self.worker.take().ok_or_else(|| {
             AppError::Unavailable("recognition worker is not available".to_owned())
         })?;
-        let (recognizer, outcome) = worker.finish()?;
+        let (recognizer, result) = worker.finish(capture_only)?;
         self.recognizer = Some(recognizer);
-        outcome
+        Ok(result)
     }
 
     fn reset_to_idle(&mut self) {
@@ -1250,14 +1298,21 @@ mod tests {
         capture.backend_error();
         let mut source = capture.take_source();
         capture.close();
-        let error = finish_worker_session(
+        let result = finish_worker_session(
             &mut source,
             &mut MustNotFinish,
             &mut AudioPipeline::new(false),
-            Some(AppError::Unavailable("earlier recognizer failure".to_owned())),
-        )
-        .unwrap_err()
-        .to_string();
+            Vec::new(),
+            Some(AppError::Unavailable(
+                "earlier recognizer failure".to_owned(),
+            )),
+            false,
+            false,
+        );
+        assert_eq!(result.audio, vec![1.0, 2.0]);
+        assert_eq!(result.capture.dropped_samples, 1);
+        assert!(result.capture.backend_failed);
+        let error = result.outcome.unwrap_err().to_string();
         assert!(error.contains("mono samples dropped"));
         assert!(error.contains("backend capture error"));
         assert!(!error.contains("earlier recognizer failure"));
@@ -1541,11 +1596,148 @@ mod tests {
         recognizer.start_session().expect("start recognizer");
         let worker =
             RecognitionWorker::spawn(Box::new(recognizer), source, false).expect("spawn worker");
-        let (_, outcome) = worker.finish().expect("finish worker");
+        let (_, result) = worker.finish(false).expect("finish worker");
+        assert_eq!(result.audio, samples);
+        assert_eq!(result.sample_rate, 16_000);
         assert_eq!(
-            outcome.expect("recognition outcome"),
+            result.outcome.expect("recognition outcome"),
             RecognitionOutcome::Transcript(samples.len().to_string())
         );
+    }
+
+    #[test]
+    fn worker_keeps_audio_after_recognizer_error() {
+        struct FailingRecognizer {
+            first_audio: Sender<()>,
+            calls: Arc<Mutex<(usize, usize, usize)>>,
+        }
+
+        impl StreamingRecognizer for FailingRecognizer {
+            fn start_session(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn accept_audio(&mut self, _: i32, _: &[f32]) -> Result<()> {
+                self.calls.lock().unwrap().0 += 1;
+                self.first_audio.send(()).unwrap();
+                Err(AppError::Unavailable(
+                    "injected recognizer error".to_owned(),
+                ))
+            }
+            fn finish_session(&mut self) -> Result<RecognitionOutcome> {
+                self.calls.lock().unwrap().1 += 1;
+                panic!("must not finalize failed recognition")
+            }
+            fn cancel_session(&mut self) -> Result<()> {
+                self.calls.lock().unwrap().2 += 1;
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(Mutex::new((0, 0, 0)));
+        let (first_audio, first_received) = mpsc::channel();
+        let mut capture = TestCapture::new();
+        capture.push(&[0.25, 0.5]);
+        let recognizer = FailingRecognizer {
+            first_audio,
+            calls: Arc::clone(&calls),
+        };
+        let worker =
+            RecognitionWorker::spawn(Box::new(recognizer), capture.take_source(), false).unwrap();
+        // The first drain frees both slots before the third sample arrives.
+        first_received.recv_timeout(Duration::from_secs(5)).unwrap();
+        capture.push(&[0.75]);
+        capture.close();
+        let (_, result) = worker.finish(false).unwrap();
+        assert_eq!(result.audio, vec![0.25, 0.5, 0.75]);
+        assert_eq!(result.sample_rate, 16_000);
+        assert_eq!(result.capture.dropped_samples, 0);
+        assert!(!result.drain_failed);
+        assert!(
+            result
+                .outcome
+                .unwrap_err()
+                .to_string()
+                .contains("injected recognizer error")
+        );
+        assert_eq!(*calls.lock().unwrap(), (1, 0, 1));
+    }
+
+    #[test]
+    fn capture_loss_overrides_recognizer_error_and_keeps_available_audio() {
+        struct FailingRecognizer(Sender<()>, Receiver<()>);
+        impl StreamingRecognizer for FailingRecognizer {
+            fn start_session(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn accept_audio(&mut self, _: i32, _: &[f32]) -> Result<()> {
+                self.0.send(()).unwrap();
+                self.1.recv_timeout(Duration::from_secs(5)).unwrap();
+                Err(AppError::Unavailable(
+                    "injected recognizer error".to_owned(),
+                ))
+            }
+            fn finish_session(&mut self) -> Result<RecognitionOutcome> {
+                panic!("must not finalize failed capture")
+            }
+            fn cancel_session(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let (first_audio, first_received) = mpsc::channel();
+        let (resume, paused) = mpsc::channel();
+        let mut capture = TestCapture::new();
+        capture.push(&[0.25, 0.5]);
+        let worker = RecognitionWorker::spawn(
+            Box::new(FailingRecognizer(first_audio, paused)),
+            capture.take_source(),
+            false,
+        )
+        .unwrap();
+        first_received.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The worker cannot drain again until the intended overflow is recorded.
+        capture.push(&[0.75, 1.0, 1.25]);
+        capture.close();
+        resume.send(()).unwrap();
+        let (_, result) = worker.finish(false).unwrap();
+        assert_eq!(&result.audio[..2], &[0.25, 0.5]);
+        assert!(result.capture.dropped_samples > 0);
+        let error = result.outcome.unwrap_err().to_string();
+        assert!(error.contains("mono samples dropped"));
+        assert!(!error.contains("injected recognizer error"));
+    }
+
+    #[test]
+    fn capture_only_finishes_without_finalizing_after_recorder_stop_error() {
+        struct MustNotFinish(Arc<Mutex<usize>>);
+        impl StreamingRecognizer for MustNotFinish {
+            fn start_session(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn accept_audio(&mut self, _: i32, _: &[f32]) -> Result<()> {
+                Ok(())
+            }
+            fn finish_session(&mut self) -> Result<RecognitionOutcome> {
+                panic!("must not finalize after stop error")
+            }
+            fn cancel_session(&mut self) -> Result<()> {
+                *self.0.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+        let cancels = Arc::new(Mutex::new(0));
+        let mut capture = TestCapture::new();
+        capture.push(&[0.25, 0.5]);
+        let worker = RecognitionWorker::spawn(
+            Box::new(MustNotFinish(Arc::clone(&cancels))),
+            capture.take_source(),
+            false,
+        )
+        .unwrap();
+        capture.close();
+        let (_, result) = worker.finish(true).unwrap();
+        assert_eq!(result.audio, vec![0.25, 0.5]);
+        assert!(result.outcome.is_err());
+        assert_eq!(*cancels.lock().unwrap(), 1);
     }
 
     #[test]

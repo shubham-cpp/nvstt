@@ -74,6 +74,13 @@ impl Recorder for NoopRecorder {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CaptureReport {
+    pub dropped_samples: usize,
+    pub backend_failed: bool,
+    pub duration_exceeded: bool,
+}
+
 #[derive(Debug, Default)]
 struct CaptureIntegrity {
     dropped_samples: AtomicUsize,
@@ -219,6 +226,14 @@ impl AudioSource {
 
     pub(crate) fn integrity_result(&self) -> Result<()> {
         self.integrity.result()
+    }
+
+    pub(crate) fn capture_report(&self) -> CaptureReport {
+        CaptureReport {
+            dropped_samples: self.integrity.dropped_samples.load(Ordering::SeqCst),
+            backend_failed: self.integrity.backend_failed.load(Ordering::SeqCst),
+            duration_exceeded: self.integrity.duration_exceeded.load(Ordering::SeqCst),
+        }
     }
 
     #[cfg(test)]
@@ -413,6 +428,8 @@ mod tests {
         let (mut writer, mut source) = capture_pair(16_000, 1, 2, 100);
         writer.accept_interleaved(&[1.0_f32, 2.0, 3.0]);
         assert_eq!(source.drain().unwrap(), vec![1.0, 2.0]);
+        assert_eq!(source.capture_report().dropped_samples, 1);
+        assert!(!source.capture_report().backend_failed);
         let message = source.integrity_result().unwrap_err().to_string();
         assert!(message.contains("1 mono samples dropped"));
     }
@@ -424,6 +441,7 @@ mod tests {
         let message = source.integrity_result().unwrap_err().to_string();
         assert!(message.contains("1 mono samples dropped"));
         assert!(message.contains("30 minute limit"));
+        assert!(source.capture_report().duration_exceeded);
         assert_eq!(writer.total_samples, 3);
     }
 
@@ -458,6 +476,7 @@ mod tests {
         drop(guard);
         let message = source.integrity_result().unwrap_err().to_string();
         assert!(message.contains("backend capture error"));
+        assert!(source.capture_report().backend_failed);
         assert!(!message.contains("mono samples dropped"));
     }
 
