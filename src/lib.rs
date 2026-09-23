@@ -15,4 +15,5 @@ pub mod notifier;
 pub mod paths;
 pub mod recognizer;
 pub mod recorder;
+pub mod recordings;
 pub mod speech_gate;
