@@ -639,6 +639,39 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn measure_two_minute_save() {
+        let dir = tempdir().unwrap();
+        let store = RecordingStore::new(dir.path().join("recordings"));
+        let mut failing_store = RecordingStore::new(dir.path().join("failed-recordings"));
+        failing_store.fail_after_wav = true;
+        let samples = vec![0.0_f32; 48_000 * 120];
+        let mut times = Vec::new();
+        let mut failure_times = Vec::new();
+        for n in 0..20 {
+            let recording = fixture(n, &samples);
+            let began = std::time::Instant::now();
+            store.save(&recording).unwrap();
+            times.push(began.elapsed().as_millis());
+
+            let began = std::time::Instant::now();
+            let failure = failing_store.save(&recording);
+            failure_times.push(began.elapsed().as_millis());
+            assert!(matches!(
+                failure,
+                Err(AppError::Unavailable(ref message)) if message == "injected staging failure"
+            ));
+        }
+        times.sort_unstable();
+        failure_times.sort_unstable();
+        println!("save: p50={} ms p95={} ms", times[9], times[18]);
+        println!(
+            "injected pre-commit failure: p50={} ms p95={} ms",
+            failure_times[9], failure_times[18]
+        );
+    }
+
+    #[test]
     fn invalid_owned_entry_is_never_pruned() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("recordings");

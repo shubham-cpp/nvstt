@@ -134,6 +134,46 @@ nvstt model install --model nemotron-speech-streaming-en-0.6b --streaming-profil
 nvstt model status --model nemotron-speech-streaming-en-0.6b --streaming-profile 560ms --json
 ```
 
+## Recent dictation audio
+
+After each stopped dictation, nvstt saves the original mono float32 input as
+`audio.wav`, with `metadata.json`, in a private directory. This includes failed
+and no-speech attempts, but not canceled sessions or sessions that never started
+capture. It keeps the seven newest committed recordings. Text history keeps ten
+successful transcripts, so its entries need not match the audio list. Match a
+successful history entry to audio by its session ID in `metadata.json`.
+
+Find a WAV file with:
+
+```bash
+if [ -n "${XDG_STATE_HOME:-}" ]; then
+  recordings="$XDG_STATE_HOME/nvstt/recordings"
+else
+  recordings="$HOME/.local/state/nvstt/recordings"  # ~/.local/state/nvstt/recordings
+fi
+find "$recordings" -mindepth 2 -maxdepth 2 -type f -name audio.wav \
+  ! -path "$recordings/.staging-*/audio.wav" -print
+```
+
+Each committed session directory contains `audio.wav` and `metadata.json`.
+The `capture` fields in the metadata mark partial recordings: nonzero
+`dropped_samples` or a true `backend_failed`, `duration_exceeded`,
+`stop_failed`, or `drain_failed` means audio can be missing. There is no
+separate `partial` key. These files are restricted to the user, but they are
+not encrypted. Backups and other processes with account access can copy them.
+Review and remove saved audio when you no longer need it.
+
+Use a selected WAV in a private evaluation manifest. This example uses the
+normal state-directory fallback; change the path if `XDG_STATE_HOME` is set:
+
+```json
+{"id":"boundary-1","audio":"/home/alex/.local/state/nvstt/recordings/1700000000000-1700000000000-1/audio.wav","reference":"hello there","category":"boundary"}
+```
+
+`model evaluate` bypasses live microphone capture. It cannot recover speech
+before the first microphone callback or after stop. Saved WAVs can aid diagnosis,
+but they do not fix missing words or reproduce capture timing and queue loss.
+
 ## Evaluate a model with a private corpus
 
 Use `nvstt model evaluate` for an accuracy and finalization report. The JSONL
