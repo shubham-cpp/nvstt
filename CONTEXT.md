@@ -35,8 +35,13 @@ _Avoid_: Recording, log entry
 
 **History retention**:
 The bounded storage of transcript text and metadata across daemon restarts.
-Audio is not retained by default.
+Recent dictation audio uses a separate seven-entry store.
 _Avoid_: Recording archive, audio history
+
+**Recent dictation audio**:
+Private original-rate WAV and metadata for a stopped attempt. The store retains
+up to seven, including failed and no-speech attempts. A save can warn or fail.
+Cancellation creates no entry.
 
 **Focused client**:
 The application surface that owns keyboard focus when delivery occurs.

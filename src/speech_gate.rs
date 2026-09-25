@@ -337,7 +337,8 @@ mod tests {
             (6.0, true),
         ] {
             nonzero.extend(
-                state.accept_frame(&frame(value), detected)
+                state
+                    .accept_frame(&frame(value), detected)
                     .into_iter()
                     .filter(|sample| *sample != 0.0),
             );

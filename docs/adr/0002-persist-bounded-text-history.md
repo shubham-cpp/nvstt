@@ -10,3 +10,8 @@ stored voice data.
 - The history store belongs under the user's XDG state directory.
 - History writes need atomic updates and a hard ten-record limit.
 - A future audio-retention feature needs a separate, explicit decision.
+
+## Subsequent decision
+
+ADR 0014 supersedes only the no-default-audio sentence above. Text history
+still keeps ten successful transcripts. Audio retention is a separate store.

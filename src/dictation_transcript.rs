@@ -88,8 +88,14 @@ impl Replacements {
             let matched = rule.pattern.iter().enumerate().all(|(offset, expected)| {
                 let parts = token_parts(tokens[index + offset]);
                 let interior_mark = rule.pattern.len() > 1
-                    && parts.core.chars().any(|c| matches!(c, '.' | '?' | '!' | ';' | ':'))
-                    && parts.core.chars().all(|c| matches!(c, '.' | '?' | '!' | ';' | ':'));
+                    && parts
+                        .core
+                        .chars()
+                        .any(|c| matches!(c, '.' | '?' | '!' | ';' | ':'))
+                    && parts
+                        .core
+                        .chars()
+                        .all(|c| matches!(c, '.' | '?' | '!' | ';' | ':'));
                 let interior_punctuation = offset > 0
                     && offset + 1 < rule.pattern.len()
                     && !parts.core.is_empty()
@@ -232,7 +238,9 @@ fn is_filled_pause(token: &str) -> bool {
     let title_case = core.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
         && core.as_bytes()[1..].iter().all(u8::is_ascii_lowercase);
     (lowercase || title_case)
-        && FILLED_PAUSES.iter().any(|filler| core.eq_ignore_ascii_case(filler))
+        && FILLED_PAUSES
+            .iter()
+            .any(|filler| core.eq_ignore_ascii_case(filler))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -243,9 +251,7 @@ struct TokenParts<'a> {
 }
 
 fn token_parts(token: &str) -> TokenParts<'_> {
-    let rest = token.trim_start_matches(|c: char| {
-        matches!(c, '"' | '\'' | '“' | '‘' | '(' | '[' | '{')
-    });
+    let rest = token.trim_start_matches(['"', '\'', '“', '‘', '(', '[', '{']);
     let core = rest.trim_end_matches(|c: char| {
         matches!(
             c,
@@ -276,6 +282,8 @@ fn word_core(token: &str) -> &str {
 mod tests {
     use super::*;
 
+    type ReplacementCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+
     fn transcript(text: &str) -> RecognitionOutcome {
         RecognitionOutcome::Transcript(text.to_owned())
     }
@@ -298,7 +306,7 @@ mod tests {
 
     #[test]
     fn replacements_preserve_identity_and_sentence_wrappers() {
-        let cases: &[(&str, &[(&str, &str)], &str)] = &[
+        let cases: &[ReplacementCase<'_>] = &[
             (
                 "C C++ C#",
                 &[("C", "cee"), ("C++", "cpp"), ("C#", "csharp")],
@@ -403,7 +411,7 @@ mod tests {
 
     #[test]
     fn phrase_replacements_do_not_swallow_standalone_punctuation() {
-        let cases: &[(&str, &[(&str, &str)], &str)] = &[
+        let cases: &[ReplacementCase<'_>] = &[
             ("nv , stt", &[("nv , stt", "nvstt")], "nv , stt"),
             ("nv \" stt", &[("nv \" stt", "nvstt")], "nv \" stt"),
             ("nv [ stt", &[("nv [ stt", "nvstt")], "nv [ stt"),
@@ -435,7 +443,10 @@ mod tests {
 
     #[test]
     fn itn_dot_limitation_is_explicit() {
-        assert_eq!(clean("DOT"), Ok(DictationTranscript::Ready("DOT".to_owned())));
+        assert_eq!(
+            clean("DOT"),
+            Ok(DictationTranscript::Ready("DOT".to_owned()))
+        );
         assert_eq!(
             dictation_transcript(transcript("DOT"), &Replacements::default(), true),
             Ok(DictationTranscript::Ready(".".to_owned())),
@@ -467,8 +478,14 @@ mod tests {
     fn technical_tokens_survive_cleanup_with_and_without_itn() {
         for itn in [false, true] {
             for text in [
-                "5 mm", "ER diagram", "a + b = c", "C++ C# .env config.rs",
-                "ER ER ER", "C C++ C", "very very", "UH UM",
+                "5 mm",
+                "ER diagram",
+                "a + b = c",
+                "C++ C# .env config.rs",
+                "ER ER ER",
+                "C C++ C",
+                "very very",
+                "UH UM",
             ] {
                 assert_eq!(
                     dictation_transcript(transcript(text), &Replacements::default(), itn),
@@ -671,7 +688,9 @@ mod tests {
             Replacements::from_pairs([("a dozen".to_owned(), "twenty one".to_owned())]);
         assert_eq!(
             dictation_transcript(transcript("I have a dozen apples"), &replacements, true),
-            Ok(DictationTranscript::Ready("I have twenty one apples".to_owned()))
+            Ok(DictationTranscript::Ready(
+                "I have twenty one apples".to_owned()
+            ))
         );
     }
 

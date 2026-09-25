@@ -939,6 +939,31 @@ mod tests {
         notifier::NoopNotifier, recorder::TestCapture,
     };
 
+    struct SyntheticRecorder {
+        samples: Arc<Vec<f32>>,
+        source: Option<AudioSource>,
+    }
+
+    impl Recorder for SyntheticRecorder {
+        fn start(&mut self) -> Result<()> {
+            self.source = Some(AudioSource::test_source(
+                48_000,
+                self.samples.as_ref().clone(),
+            ));
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<CaptureReport> {
+            Ok(CaptureReport::default())
+        }
+        fn cancel(&mut self) -> Result<()> {
+            self.source.take();
+            Ok(())
+        }
+        fn audio_source(&mut self) -> Result<AudioSource> {
+            Ok(self.source.take().unwrap())
+        }
+    }
+
     fn saved_recordings(
         directory: &TempDir,
     ) -> Vec<(crate::recordings::RecordingMetadata, crate::audio::Waveform)> {
@@ -2196,31 +2221,6 @@ mod tests {
     #[test]
     #[ignore]
     fn measure_two_minute_stop_to_result_with_and_without_storage() {
-        struct SyntheticRecorder {
-            samples: Arc<Vec<f32>>,
-            source: Option<AudioSource>,
-        }
-
-        impl Recorder for SyntheticRecorder {
-            fn start(&mut self) -> Result<()> {
-                self.source = Some(AudioSource::test_source(
-                    48_000,
-                    self.samples.as_ref().clone(),
-                ));
-                Ok(())
-            }
-            fn stop(&mut self) -> Result<CaptureReport> {
-                Ok(CaptureReport::default())
-            }
-            fn cancel(&mut self) -> Result<()> {
-                self.source.take();
-                Ok(())
-            }
-            fn audio_source(&mut self) -> Result<AudioSource> {
-                Ok(self.source.take().unwrap())
-            }
-        }
-
         struct SignalingRecognizer {
             inner: StaticRecognizer,
             ready: Sender<()>,
@@ -2250,8 +2250,8 @@ mod tests {
 
         fn trial(daemon: &mut Daemon, ready: &Receiver<()>, expect_warning: bool) -> f64 {
             assert!(daemon.handle(IpcRequest::Toggle).is_ok());
-            // Wait outside the timer until the worker has consumed and processed
-            // the synthetic 120-second source, as it would during listening.
+            // Wait outside the timer for the worker to process its first audio chunk.
+            // Remaining audio may still be processed during the timed stop.
             ready.recv_timeout(Duration::from_secs(30)).unwrap();
             let started = Instant::now();
             let response = daemon.handle(IpcRequest::Toggle);
@@ -2333,6 +2333,24 @@ mod tests {
                     && wave.sample_rate == 48_000
                     && wave.samples.len() == samples.len())
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn measure_two_minute_capture_peak_memory() {
+        let samples = Arc::new(vec![0.25_f32; 48_000 * 120]);
+        let (mut daemon, effects, directory) = observed_daemon(CaptureFault::None);
+        daemon.recorder = Box::new(SyntheticRecorder {
+            samples,
+            source: None,
+        });
+        assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+        let IpcResponse::Command { result } = daemon.handle(IpcRequest::Toggle) else {
+            panic!("expected command");
+        };
+        assert!(result.ok);
+        assert_eq!(effects.lock().unwrap().sent.len(), 1);
+        assert_eq!(saved_recordings(&directory).len(), 1);
     }
 
     #[test]

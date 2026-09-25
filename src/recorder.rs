@@ -116,7 +116,9 @@ impl CaptureIntegrity {
         let mut reasons = Vec::new();
         let dropped = self.dropped_samples.load(Ordering::SeqCst);
         if dropped != 0 {
-            reasons.push(format!("{dropped} mono samples dropped by the capture queue"));
+            reasons.push(format!(
+                "{dropped} mono samples dropped by the capture queue"
+            ));
         }
         if self.backend_failed.load(Ordering::SeqCst) {
             let detail = self
@@ -162,7 +164,9 @@ impl CaptureWriter {
             let beyond_limit = self.total_samples >= self.max_samples;
             self.total_samples = self.total_samples.saturating_add(1);
             if beyond_limit {
-                self.integrity.duration_exceeded.store(true, Ordering::SeqCst);
+                self.integrity
+                    .duration_exceeded
+                    .store(true, Ordering::SeqCst);
                 continue;
             }
             let sum = frame
@@ -170,7 +174,9 @@ impl CaptureWriter {
                 .map(|sample| f32::from_sample(*sample))
                 .sum::<f32>();
             if self.producer.push(sum / frame.len() as f32).is_err() {
-                self.integrity.dropped_samples.fetch_add(1, Ordering::SeqCst);
+                self.integrity
+                    .dropped_samples
+                    .fetch_add(1, Ordering::SeqCst);
             }
         }
     }
@@ -249,8 +255,7 @@ impl AudioSource {
 
     #[cfg(test)]
     pub(crate) fn test_source(sample_rate: i32, samples: Vec<f32>) -> Self {
-        let (mut writer, source) =
-            capture_pair(sample_rate, 1, samples.len().max(1), usize::MAX);
+        let (mut writer, source) = capture_pair(sample_rate, 1, samples.len().max(1), usize::MAX);
         writer.accept_interleaved(&samples);
         source
     }
@@ -444,7 +449,11 @@ mod tests {
         let mut recorder = NoopRecorder::default();
         recorder.start().unwrap();
         let samples = vec![0.25_f32; NOOP_SAMPLE_RATE as usize * (CAPTURE_QUEUE_SECONDS + 1)];
-        recorder.writer.as_mut().unwrap().accept_interleaved(&samples);
+        recorder
+            .writer
+            .as_mut()
+            .unwrap()
+            .accept_interleaved(&samples);
         let report = recorder.stop().unwrap();
         assert!(report.dropped_samples > 0);
         assert!(!report.backend_failed);
@@ -499,7 +508,9 @@ mod tests {
     fn backend_failure_survives_an_unavailable_diagnostic_slot() {
         let (_writer, source) = capture_pair(16_000, 1, 2, 100);
         let guard = source.integrity.backend_message.lock().unwrap();
-        source.integrity.record_backend_error(&"injected device failure");
+        source
+            .integrity
+            .record_backend_error(&"injected device failure");
         drop(guard);
         let message = source.integrity_result().unwrap_err().to_string();
         assert!(message.contains("backend capture error"));
