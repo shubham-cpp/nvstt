@@ -15,7 +15,7 @@ const NOOP_SAMPLE_RATE: i32 = 16_000;
 pub trait Recorder: Send {
     fn start(&mut self) -> Result<()>;
     /// Stop capturing. The live source stays readable so the worker can drain.
-    fn stop(&mut self) -> Result<()>;
+    fn stop(&mut self) -> Result<CaptureReport>;
     fn cancel(&mut self) -> Result<()>;
     /// Take the sole PCM consumer for this capture session.
     fn audio_source(&mut self) -> Result<AudioSource>;
@@ -49,16 +49,17 @@ impl Recorder for NoopRecorder {
         Ok(())
     }
 
-    fn stop(&mut self) -> Result<()> {
+    fn stop(&mut self) -> Result<CaptureReport> {
         if !self.active {
             return Err(AppError::InvalidState("recorder is not active".to_owned()));
         }
         self.active = false;
         self.writer.take();
-        self.integrity
+        Ok(self
+            .integrity
             .as_ref()
             .expect("active capture integrity")
-            .result()
+            .report())
     }
 
     fn cancel(&mut self) -> Result<()> {
@@ -75,10 +76,16 @@ impl Recorder for NoopRecorder {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CaptureReport {
+pub struct CaptureReport {
     pub dropped_samples: usize,
     pub backend_failed: bool,
     pub duration_exceeded: bool,
+}
+
+impl CaptureReport {
+    pub(crate) fn failed(&self) -> bool {
+        self.dropped_samples != 0 || self.backend_failed || self.duration_exceeded
+    }
 }
 
 #[derive(Debug, Default)]
@@ -90,6 +97,14 @@ struct CaptureIntegrity {
 }
 
 impl CaptureIntegrity {
+    fn report(&self) -> CaptureReport {
+        CaptureReport {
+            dropped_samples: self.dropped_samples.load(Ordering::SeqCst),
+            backend_failed: self.backend_failed.load(Ordering::SeqCst),
+            duration_exceeded: self.duration_exceeded.load(Ordering::SeqCst),
+        }
+    }
+
     fn record_backend_error(&self, error: &impl Display) {
         self.backend_failed.store(true, Ordering::SeqCst);
         if let Ok(mut message) = self.backend_message.try_lock() {
@@ -229,11 +244,7 @@ impl AudioSource {
     }
 
     pub(crate) fn capture_report(&self) -> CaptureReport {
-        CaptureReport {
-            dropped_samples: self.integrity.dropped_samples.load(Ordering::SeqCst),
-            backend_failed: self.integrity.backend_failed.load(Ordering::SeqCst),
-            duration_exceeded: self.integrity.duration_exceeded.load(Ordering::SeqCst),
-        }
+        self.integrity.report()
     }
 
     #[cfg(test)]
@@ -345,16 +356,17 @@ impl Recorder for CpalRecorder {
         Ok(())
     }
 
-    fn stop(&mut self) -> Result<()> {
+    fn stop(&mut self) -> Result<CaptureReport> {
         let stream = self
             .stream
             .take()
             .ok_or_else(|| AppError::InvalidState("recorder is not active".to_owned()))?;
         drop(stream);
-        self.integrity
+        Ok(self
+            .integrity
             .as_ref()
             .expect("active capture integrity")
-            .result()
+            .report())
     }
 
     fn cancel(&mut self) -> Result<()> {
@@ -406,6 +418,10 @@ impl TestCapture {
         self.writer.take();
     }
 
+    pub(crate) fn report(&self) -> CaptureReport {
+        self.integrity.report()
+    }
+
     pub(crate) fn take_source(&mut self) -> AudioSource {
         self.source.take().unwrap()
     }
@@ -421,6 +437,17 @@ mod tests {
         recorder.start().unwrap();
         let _source = recorder.audio_source().unwrap();
         assert!(recorder.audio_source().is_err());
+    }
+
+    #[test]
+    fn noop_stop_reports_queue_loss_without_failing_shutdown() {
+        let mut recorder = NoopRecorder::default();
+        recorder.start().unwrap();
+        let samples = vec![0.25_f32; NOOP_SAMPLE_RATE as usize * (CAPTURE_QUEUE_SECONDS + 1)];
+        recorder.writer.as_mut().unwrap().accept_interleaved(&samples);
+        let report = recorder.stop().unwrap();
+        assert!(report.dropped_samples > 0);
+        assert!(!report.backend_failed);
     }
 
     #[test]

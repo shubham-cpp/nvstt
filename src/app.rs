@@ -484,9 +484,13 @@ impl Daemon {
         self.status.message = "finalizing".to_owned();
         self.safe_notify(NotificationEvent::Finalizing);
 
-        let stop_error = self.recorder.stop().err();
-        let stop_failed = stop_error.is_some();
-        let worker = match self.finish_recognition_worker(stop_failed) {
+        let stop = self.recorder.stop();
+        let stopped_at_ms = now_ms();
+        let stop_failed = stop.is_err();
+        let capture_only = stop_failed || stop.as_ref().is_ok_and(CaptureReport::failed);
+        let worker = self.finish_recognition_worker(capture_only);
+        let stop_error = stop.err();
+        let worker = match worker {
             Ok(worker) => worker,
             Err(error) => {
                 warn!(error = %error, "recognition worker returned no audio; audio was not saved");
@@ -520,7 +524,7 @@ impl Daemon {
                 .session_id
                 .clone()
                 .expect("listening session ID"),
-            stopped_at_ms: now_ms(), // Task 3 moves this read to immediately after stop.
+            stopped_at_ms,
             sample_rate: worker.sample_rate,
             settings: RecordingSettings {
                 model: self.config.model.clone(),
@@ -1010,6 +1014,7 @@ mod tests {
         Queue,
         Backend,
         Both,
+        Duration,
     }
 
     struct FixtureRecorder {
@@ -1024,6 +1029,7 @@ mod tests {
                 CaptureFault::None => session.push(&[0.25]),
                 CaptureFault::Queue => session.push(&[0.25, 0.5, 0.75]),
                 CaptureFault::Backend => session.backend_error(),
+                CaptureFault::Duration => session.push(&vec![0.25; 101]),
                 CaptureFault::Both => {
                     session.push(&[0.25, 0.5, 0.75]);
                     session.backend_error();
@@ -1034,10 +1040,10 @@ mod tests {
             Ok(())
         }
 
-        fn stop(&mut self) -> Result<()> {
-            self.session.as_mut().unwrap().close();
-            // Deliberately return Ok: the worker must independently check integrity.
-            Ok(())
+        fn stop(&mut self) -> Result<CaptureReport> {
+            let session = self.session.as_mut().unwrap();
+            session.close();
+            Ok(session.report())
         }
 
         fn cancel(&mut self) -> Result<()> {
@@ -1078,12 +1084,12 @@ mod tests {
             Ok(())
         }
 
-        fn stop(&mut self) -> Result<()> {
+        fn stop(&mut self) -> Result<CaptureReport> {
             self.stop_events.send("stop entered").unwrap();
             self.producer.take().unwrap().join().unwrap();
             self.stop_events.send("producer joined").unwrap();
-            // As with FixtureRecorder, require the real worker integrity check.
-            Ok(())
+            // Require the real worker integrity check even with a clean stop report.
+            Ok(CaptureReport::default())
         }
 
         fn cancel(&mut self) -> Result<()> {
@@ -1106,7 +1112,7 @@ mod tests {
             self.0.start()
         }
 
-        fn stop(&mut self) -> Result<()> {
+        fn stop(&mut self) -> Result<CaptureReport> {
             self.0.stop()?;
             Err(AppError::Unavailable(
                 "injected backend capture error".to_owned(),
@@ -1247,6 +1253,7 @@ mod tests {
             CaptureFault::Queue,
             CaptureFault::Backend,
             CaptureFault::Both,
+            CaptureFault::Duration,
         ] {
             let (mut daemon, effects, directory) = observed_daemon(fault);
             assert!(daemon.handle(IpcRequest::Toggle).is_ok());
@@ -1269,13 +1276,22 @@ mod tests {
             assert_eq!(saved.len(), 1);
             let (metadata, wave) = &saved[0];
             assert_eq!(metadata.transcription, TranscriptionStatus::Failed);
+            assert!(!metadata.capture.stop_failed);
+            assert!(!metadata.capture.drain_failed);
+            assert_eq!(
+                metadata.capture.duration_exceeded,
+                matches!(fault, CaptureFault::Duration)
+            );
             assert_eq!(
                 metadata.capture.backend_failed,
                 matches!(fault, CaptureFault::Backend | CaptureFault::Both)
             );
             assert_eq!(
                 metadata.capture.dropped_samples > 0,
-                matches!(fault, CaptureFault::Queue | CaptureFault::Both)
+                matches!(
+                    fault,
+                    CaptureFault::Queue | CaptureFault::Both | CaptureFault::Duration
+                )
             );
             assert_eq!(metadata.frames, wave.samples.len());
             assert_eq!(wave.sample_rate, 16_000);
@@ -1395,6 +1411,12 @@ mod tests {
             );
             // Do not let the live worker drain the final sample before Finish.
             finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let before_release_ms = now_ms();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while now_ms() < before_release_ms + 10 {
+                assert!(Instant::now() < deadline, "clock did not advance");
+                thread::sleep(Duration::from_millis(1));
+            }
             audio_resume_tx.send(()).unwrap();
             let (mut daemon, response) = stop.join().unwrap();
             let IpcResponse::Command { result } = response else {
@@ -1412,6 +1434,8 @@ mod tests {
             assert_eq!(saved.len(), 1);
             assert_eq!(saved[0].0.transcription, TranscriptionStatus::Failed);
             assert!(saved[0].0.capture.backend_failed);
+            assert!(!saved[0].0.capture.stop_failed);
+            assert!(saved[0].0.stopped_at_ms <= before_release_ms);
             assert_eq!(saved[0].0.frames, 2);
             assert_eq!(saved[0].1.samples, [0.25, 0.5]);
             {
@@ -1931,7 +1955,7 @@ mod tests {
             fn start(&mut self) -> Result<()> {
                 Err(AppError::Unavailable("recorder start failed".into()))
             }
-            fn stop(&mut self) -> Result<()> {
+            fn stop(&mut self) -> Result<CaptureReport> {
                 panic!("no active capture")
             }
             fn cancel(&mut self) -> Result<()> {
@@ -2185,8 +2209,8 @@ mod tests {
                 ));
                 Ok(())
             }
-            fn stop(&mut self) -> Result<()> {
-                Ok(())
+            fn stop(&mut self) -> Result<CaptureReport> {
+                Ok(CaptureReport::default())
             }
             fn cancel(&mut self) -> Result<()> {
                 self.source.take();
