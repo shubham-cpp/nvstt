@@ -1049,7 +1049,11 @@ mod tests {
 
     impl Recorder for FixtureRecorder {
         fn start(&mut self) -> Result<()> {
-            let mut session = TestCapture::new();
+            let mut session = if matches!(self.fault, CaptureFault::Duration) {
+                TestCapture::with_capacity(101)
+            } else {
+                TestCapture::new()
+            };
             match self.fault {
                 CaptureFault::None => session.push(&[0.25]),
                 CaptureFault::Queue => session.push(&[0.25, 0.5, 0.75]),
@@ -1311,13 +1315,15 @@ mod tests {
                 metadata.capture.backend_failed,
                 matches!(fault, CaptureFault::Backend | CaptureFault::Both)
             );
-            assert_eq!(
-                metadata.capture.dropped_samples > 0,
-                matches!(
-                    fault,
-                    CaptureFault::Queue | CaptureFault::Both | CaptureFault::Duration
-                )
-            );
+            if matches!(fault, CaptureFault::Duration) {
+                assert_eq!(metadata.capture.dropped_samples, 0);
+                assert_eq!(wave.samples.len(), 100);
+            } else {
+                assert_eq!(
+                    metadata.capture.dropped_samples > 0,
+                    matches!(fault, CaptureFault::Queue | CaptureFault::Both)
+                );
+            }
             assert_eq!(metadata.frames, wave.samples.len());
             assert_eq!(wave.sample_rate, 16_000);
             assert!(daemon.handle(IpcRequest::Toggle).is_ok());

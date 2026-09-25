@@ -402,7 +402,11 @@ pub(crate) struct TestCapture {
 #[cfg(test)]
 impl TestCapture {
     pub(crate) fn new() -> Self {
-        let (writer, source) = capture_pair(16_000, 1, 2, 100);
+        Self::with_capacity(2)
+    }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        let (writer, source) = capture_pair(16_000, 1, capacity, 100);
         Self {
             integrity: Arc::clone(&source.integrity),
             writer: Some(writer),

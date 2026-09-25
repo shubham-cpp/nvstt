@@ -139,9 +139,12 @@ nvstt model status --model nemotron-speech-streaming-en-0.6b --streaming-profile
 After each stopped dictation, nvstt saves the original mono float32 input as
 `audio.wav`, with `metadata.json`, in a private directory. This includes failed
 and no-speech attempts, but not canceled sessions or sessions that never started
-capture. It keeps the seven newest committed recordings. Text history keeps ten
-successful transcripts, so its entries need not match the audio list. Match a
-successful history entry to audio by its session ID in `metadata.json`.
+capture. It normally keeps the seven newest owned recordings. A published save
+can temporarily leave more than seven if post-publication root sync or pruning
+fails. Startup reconciliation or a later successful save restores the seven-entry
+limit. Text history keeps ten successful transcripts, so its entries need not
+match the audio list. Match a successful history entry to audio by its session ID
+in `metadata.json`.
 
 Find a WAV file with:
 
