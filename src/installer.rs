@@ -146,16 +146,19 @@ fn download_file<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(30))
-        .timeout_read(Duration::from_secs(30))
+    let agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_body(Some(Duration::from_secs(30)))
         .user_agent(concat!("nvstt/", env!("CARGO_PKG_VERSION")))
-        .build();
-    let response = agent.get(download_url).call().map_err(|error| {
+        .build()
+        .new_agent();
+    let mut response = agent.get(download_url).call().map_err(|error| {
         AppError::Unavailable(format!("{description} download failed: {error}"))
     })?;
     let total_bytes = response
-        .header("content-length")
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
 
     let file = fs::OpenOptions::new()
@@ -163,7 +166,7 @@ where
         .write(true)
         .open(destination)?;
     let mut file = io::BufWriter::new(file);
-    let mut reader = response.into_reader();
+    let mut reader = response.body_mut().as_reader();
     let mut buffer = [0_u8; DOWNLOAD_BUFFER_SIZE];
     let mut downloaded_bytes = 0_u64;
     let mut next_progress = PROGRESS_STEP;
@@ -356,7 +359,7 @@ fn remove_path(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
+    use std::{fs::File, net::TcpListener, thread};
 
     use bzip2::{Compression, write::BzEncoder};
     use tar::{Builder, Header};
@@ -388,6 +391,53 @@ mod tests {
             .expect("finish tar")
             .finish()
             .expect("finish bzip2");
+    }
+
+    fn serve_response(response: &'static [u8]) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("download request");
+            let mut request = [0_u8; 1024];
+            assert!(stream.read(&mut request).expect("read request") > 0);
+            stream.write_all(response).expect("write response");
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn download_streams_file_and_reports_progress() {
+        let (url, server) =
+            serve_response(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc");
+        let directory = tempdir().expect("temporary directory");
+        let destination = directory.path().join("model.tar.bz2");
+        let mut progress = Vec::new();
+
+        let downloaded = download_file(&destination, &url, "model archive", &mut |event| {
+            progress.push((event.downloaded_bytes, event.total_bytes));
+        })
+        .expect("download");
+        server.join().expect("server thread");
+
+        assert_eq!(downloaded, 3);
+        assert_eq!(fs::read(destination).expect("downloaded file"), b"abc");
+        assert_eq!(progress, vec![(0, Some(3)), (3, Some(3))]);
+    }
+
+    #[test]
+    fn download_rejects_truncated_response() {
+        let (url, server) =
+            serve_response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nabc");
+        let directory = tempdir().expect("temporary directory");
+        let destination = directory.path().join("model.tar.bz2");
+
+        let result = download_file(&destination, &url, "model archive", &mut |_| {});
+        server.join().expect("server thread");
+
+        assert!(result.is_err(), "short response must not be accepted");
     }
 
     #[test]

@@ -14,7 +14,7 @@
 
 - Work only in the linked `feature/recent-dictation-audio` worktree. Do not merge or push.
 - Keep `main`'s untracked files and the worktree's existing untracked research notes untouched.
-- Stable non-yanked direct releases checked on 2026-09-25: `bzip2 0.6.1`, `clap 4.6.7`, `cpal 0.18.2`, `sherpa-onnx 1.13.8`, `thiserror 2.0.21`, `toml 0.9.8`, `ureq 3.4.2`. The other 14 direct packages already resolve to their latest stable release. Recheck at execution time.
+- Stable non-yanked direct releases checked on 2026-09-25: `bzip2 0.6.1`, `clap 4.6.7`, `cpal 0.18.2`, `sherpa-onnx 1.13.8`, `thiserror 2.0.21`, `toml 1.1.6+spec-1.1.0`, `ureq 3.4.2`. The other 14 direct packages already resolve to their latest stable release. Recheck at execution time.
 - Preserve Nemotron 560 ms, speech-gate default, privacy, original audio, seven WAVs, ten text records, final-only delivery, CLI and IPC. No Python rewrite or model switch.
 - Use `mise exec -- cargo ...`; preserve default CPU and optional CUDA feature definitions. Record any CUDA verification this host cannot run.
 - No personal audio or corrected transcript goes into Git, logs sent remotely, or any external ASR service.
@@ -26,7 +26,7 @@
 1. Ureq 3 must keep model download redirects, HTTPS, connect/body timeouts, content-length checks, and partial-download failures. Add a local loopback HTTP test for a truncated response and one for successful download.
 2. Native Sherpa updates may change words, silence handling, or stream finalization. Replay the identical private WAV set with gate on and off before and after; never use text history as corrected truth.
 3. Bzip2 0.6 must not weaken archive-path escape checks or model-file validation. Keep the existing archive extraction tests green.
-4. TOML 0.9 must preserve invalid-config errors and nested settings. Keep configuration and replacement tests green.
+4. TOML 1.1 must preserve invalid-config errors and nested settings. Keep configuration and replacement tests green.
 5. CPAL 0.18.2 must preserve dropped-sample and backend failure reporting. Keep recorder and daemon capture-integrity tests green; no hardware claim without a live test.
 
 ---
@@ -121,7 +121,7 @@ print("private_snapshot_entries=", len(manifest), "path=", snapshot)
 **Interfaces:** Keeps `install_model`, `Config::load`, `CpalRecorder`, and `AppError` behavior. Produces current direct dependencies plus latest resolver-compatible lockfile packages.
 
 - [ ] **Step 1: Migrate download tests first.** In `src/installer.rs` tests, add a loopback `TcpListener` fixture that serves a small complete response and a Content-Length larger than the bytes sent. Assert `download_file` reports byte count/progress for the complete response and a truncated-download error for the short one. The fixture must never contact public endpoints.
-- [ ] **Step 2: Update manifest versions.** Replace the direct requirements for `bzip2` with `0.6.1` (retain `static`), `clap` with `4.6.7`, `cpal` with `0.18.2`, `thiserror` with `2.0.21`, `toml` with `0.9.8`, and `ureq` with `3.4.2`. Preserve existing feature choices unless the new package requires a documented equivalent.
+- [ ] **Step 2: Update manifest versions.** Replace the direct requirements for `bzip2` with `0.6.1` (retain `static`), `clap` with `4.6.7`, `cpal` with `0.18.2`, `thiserror` with `2.0.21`, `toml` with `1.1.6`, and `ureq` with `3.4.2`. Preserve existing feature choices unless the new package requires a documented equivalent.
 - [ ] **Step 3: Use current HTTP APIs.** In `download_file`, replace `ureq::AgentBuilder` with `ureq::Agent::config_builder()`. Use `.timeout_connect(Some(Duration::from_secs(30)))`, `.timeout_recv_body(Some(Duration::from_secs(30)))`, `.user_agent(concat!("nvstt/", env!("CARGO_PKG_VERSION")))`, `.build().new_agent()`. Read `content-length` from `response.headers().get("content-length").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok())`. Use `response.body_mut().as_reader()` for the streaming copy. Keep the existing `create_new`, length validation, progress, and sync order.
 - [ ] **Step 4: Run focused tests.** Run `mise exec -- cargo test installer:: --quiet`, `mise exec -- cargo test config:: --quiet`, `mise exec -- cargo test recorder:: --quiet`, and `mise exec -- cargo test app:: --quiet`. Fix only migration breakage; add a failing test first if a new API changes behavior.
 - [ ] **Step 5: Refresh resolver-compatible transitive packages.** Run `mise exec -- cargo update`, then inspect `Cargo.lock` for direct-version mismatches and incompatible Rust versions. Recheck the official latest stable direct versions. If a current stable direct release cannot work without a policy change, stop and ask rather than claim full completion.
