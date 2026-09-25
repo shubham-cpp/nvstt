@@ -154,7 +154,12 @@ impl RecordingStore {
             Ok(())
         })();
         if let Err(error) = root_sync {
-            warnings.push(format!("directory sync failed: {error}"));
+            return Ok(SaveOutcome {
+                path,
+                retention_warning: Some(format!(
+                    "recording saved, but directory sync failed: {error}"
+                )),
+            });
         }
         if let Err(error) = self.prune() {
             warnings.push(format!("retention prune failed; retry on startup: {error}"));
@@ -563,6 +568,39 @@ mod tests {
                 .unwrap()
                 .contains("directory sync")
         );
+    }
+
+    #[test]
+    fn failed_root_sync_keeps_all_previous_entries_until_reconcile() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("recordings");
+        let healthy = RecordingStore::new(root.clone());
+        for n in 0..7 {
+            healthy.save(&fixture(n, &[0.125])).unwrap();
+        }
+        let foreign = root.join("notes.txt");
+        fs::write(&foreign, b"keep").unwrap();
+        let mut failing = RecordingStore::new(root.clone());
+        failing.fail_root_dir_sync = true;
+        let saved = failing.save(&fixture(7, &[0.25])).unwrap();
+        assert!(saved.path.join("audio.wav").is_file());
+        assert!(
+            saved
+                .retention_warning
+                .as_deref()
+                .unwrap()
+                .contains("directory sync")
+        );
+        assert_eq!(failing.owned_entries().unwrap().len(), 8);
+        assert!(
+            entries(&root)
+                .iter()
+                .any(|p| p.file_name().unwrap().to_string_lossy().ends_with("-0"))
+        );
+        healthy.reconcile().unwrap();
+        assert_eq!(healthy.owned_entries().unwrap().len(), 7);
+        assert!(saved.path.exists());
+        assert_eq!(fs::read(foreign).unwrap(), b"keep");
     }
 
     #[test]
