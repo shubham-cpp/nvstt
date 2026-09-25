@@ -40,14 +40,32 @@ pub struct RecordingMetadata {
     pub transcription: TranscriptionStatus,
 }
 
-pub struct Recording {
-    pub metadata: RecordingMetadata,
+pub struct RecordingSettings {
+    pub model: String,
+    pub streaming_profile: String,
+    pub speech_gate: bool,
+    pub denoise: bool,
+    pub itn: bool,
+}
+
+pub struct RecordingInput {
+    pub session_id: String,
+    pub stopped_at_ms: u64,
+    pub sample_rate: i32,
+    pub settings: RecordingSettings,
+    pub capture: CaptureStatus,
+    pub transcription: TranscriptionStatus,
     pub samples: Vec<f32>,
+}
+
+pub enum SaveWarning {
+    DirectorySyncFailed(AppError),
+    PruneFailed(AppError),
 }
 
 pub struct SaveOutcome {
     pub path: PathBuf,
-    pub retention_warning: Option<String>,
+    pub warnings: Vec<SaveWarning>,
 }
 
 pub struct RecordingStore {
@@ -77,16 +95,25 @@ impl RecordingStore {
         }
     }
 
-    pub fn save(&self, recording: &Recording) -> Result<SaveOutcome> {
-        let metadata = &recording.metadata;
-        if metadata.version != 1
-            || !valid_id(&metadata.session_id)
-            || metadata.frames != recording.samples.len()
-            || metadata.sample_rate <= 0
-        {
+    pub fn save(&self, recording: &RecordingInput) -> Result<SaveOutcome> {
+        if !valid_id(&recording.session_id) || recording.sample_rate <= 0 {
             return Err(AppError::Unavailable("invalid recording metadata".into()));
         }
-        let payload = serde_json::to_vec_pretty(metadata)?;
+        let metadata = RecordingMetadata {
+            version: 1,
+            session_id: recording.session_id.clone(),
+            stopped_at_ms: recording.stopped_at_ms,
+            sample_rate: recording.sample_rate,
+            frames: recording.samples.len(),
+            model: recording.settings.model.clone(),
+            streaming_profile: recording.settings.streaming_profile.clone(),
+            speech_gate: recording.settings.speech_gate,
+            denoise: recording.settings.denoise,
+            itn: recording.settings.itn,
+            capture: recording.capture.clone(),
+            transcription: recording.transcription,
+        };
+        let payload = serde_json::to_vec_pretty(&metadata)?;
         self.prepare_root()?;
         let path = self.root.join(format!(
             "{:020}-{}",
@@ -106,9 +133,10 @@ impl RecordingStore {
         let owned = self.owned_entries()?;
         if owned.len() >= MAX_RECORDINGS {
             let oldest_retained = &owned[owned.len() - MAX_RECORDINGS];
-            if (metadata.stopped_at_ms, metadata.session_id.as_str())
-                < (oldest_retained.1, oldest_retained.2.as_str())
-            {
+            let older = metadata.stopped_at_ms < oldest_retained.1
+                || metadata.stopped_at_ms == oldest_retained.1
+                    && cmp_ids(&metadata.session_id, &oldest_retained.2).is_lt();
+            if older {
                 return Err(AppError::Unavailable(
                     "recording is older than the retained entries".into(),
                 ));
@@ -142,7 +170,6 @@ impl RecordingStore {
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
-        let mut warnings = Vec::new();
         let root_sync = (|| -> Result<()> {
             #[cfg(test)]
             if self.fail_root_dir_sync {
@@ -156,19 +183,26 @@ impl RecordingStore {
         if let Err(error) = root_sync {
             return Ok(SaveOutcome {
                 path,
-                retention_warning: Some(format!(
-                    "recording saved, but directory sync failed: {error}"
-                )),
+                warnings: vec![SaveWarning::DirectorySyncFailed(error)],
             });
         }
-        if let Err(error) = self.prune() {
-            warnings.push(format!("retention prune failed; retry on startup: {error}"));
-        }
-        Ok(SaveOutcome {
-            path,
-            retention_warning: (!warnings.is_empty())
-                .then(|| format!("recording saved, but {}", warnings.join("; "))),
-        })
+        let warnings = self
+            .prune()
+            .err()
+            .map(SaveWarning::PruneFailed)
+            .into_iter()
+            .collect();
+        Ok(SaveOutcome { path, warnings })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_root_sync_for_test(&mut self) {
+        self.fail_root_dir_sync = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_prune_for_test(&mut self) {
+        self.fail_prune = true;
     }
 
     pub fn reconcile(&self) -> Result<()> {
@@ -266,7 +300,7 @@ impl RecordingStore {
                 owned.push((path, timestamp, id.to_owned()));
             }
         }
-        owned.sort_by(|a, b| (a.1, &a.2).cmp(&(b.1, &b.2)));
+        owned.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| cmp_ids(&a.2, &b.2)));
         Ok(owned)
     }
 }
@@ -284,6 +318,20 @@ fn ensure_real_directory(path: &Path) -> Result<()> {
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn cmp_decimal(a: &str, b: &str) -> std::cmp::Ordering {
+    let left = a.trim_start_matches('0');
+    let right = b.trim_start_matches('0');
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
+
+fn cmp_ids(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a_start, a_seq) = a.split_once('-').expect("validated session ID");
+    let (b_start, b_seq) = b.split_once('-').expect("validated session ID");
+    cmp_decimal(a_start, b_start)
+        .then_with(|| cmp_decimal(a_seq, b_seq))
+        .then_with(|| a.cmp(b))
 }
 
 fn valid_id(id: &str) -> bool {
@@ -337,29 +385,27 @@ mod tests {
     use super::*;
     use crate::{config::Config, domain::TranscriptionStatus};
 
-    fn fixture(n: u64, samples: &[f32]) -> Recording {
+    fn fixture(n: u64, samples: &[f32]) -> RecordingInput {
         let config = Config::default();
-        Recording {
-            metadata: RecordingMetadata {
-                version: 1,
-                session_id: format!("1700000000000-{n}"),
-                stopped_at_ms: 1_700_000_000_000 + n,
-                sample_rate: 48_000,
-                frames: samples.len(),
+        RecordingInput {
+            session_id: format!("1700000000000-{n}"),
+            stopped_at_ms: 1_700_000_000_000 + n,
+            sample_rate: 48_000,
+            settings: RecordingSettings {
                 model: config.model,
                 streaming_profile: config.streaming_profile,
                 speech_gate: config.speech_gate,
                 denoise: config.denoise,
                 itn: config.itn,
-                capture: CaptureStatus {
-                    dropped_samples: 0,
-                    backend_failed: false,
-                    duration_exceeded: false,
-                    stop_failed: false,
-                    drain_failed: false,
-                },
-                transcription: TranscriptionStatus::Succeeded,
             },
+            capture: CaptureStatus {
+                dropped_samples: 0,
+                backend_failed: false,
+                duration_exceeded: false,
+                stop_failed: false,
+                drain_failed: false,
+            },
+            transcription: TranscriptionStatus::Succeeded,
             samples: samples.to_vec(),
         }
     }
@@ -378,7 +424,7 @@ mod tests {
         let store = RecordingStore::new(root.clone());
         for n in 0..8 {
             let outcome = store.save(&fixture(n, &[0.125, -0.25])).unwrap();
-            assert!(outcome.retention_warning.is_none());
+            assert!(outcome.warnings.is_empty());
             let wave = crate::audio::read_wav(&outcome.path.join("audio.wav")).unwrap();
             assert_eq!(wave.sample_rate, 48_000);
             assert_eq!(wave.samples, [0.125, -0.25]);
@@ -416,13 +462,53 @@ mod tests {
     }
 
     #[test]
+    fn input_derives_disk_fields_and_preserves_wav() {
+        let dir = tempdir().unwrap();
+        let store = RecordingStore::new(dir.path().join("recordings"));
+        let input: RecordingInput = fixture(0, &[0.125, -0.25]);
+        let saved = store.save(&input).unwrap();
+        assert!(saved.warnings.is_empty());
+        let metadata: RecordingMetadata =
+            serde_json::from_slice(&fs::read(saved.path.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(metadata.version, 1);
+        assert_eq!(metadata.frames, input.samples.len());
+        assert_eq!(metadata.model, input.settings.model);
+        assert_eq!(metadata.streaming_profile, input.settings.streaming_profile);
+        assert_eq!(metadata.speech_gate, input.settings.speech_gate);
+        assert_eq!(metadata.denoise, input.settings.denoise);
+        assert_eq!(metadata.itn, input.settings.itn);
+        let wave = crate::audio::read_wav(&saved.path.join("audio.wav")).unwrap();
+        assert_eq!(wave.sample_rate, input.sample_rate);
+        assert_eq!(wave.samples, input.samples);
+    }
+
+    #[test]
+    fn equal_stop_times_use_numeric_session_sequence_for_stale_check_and_rotation() {
+        let dir = tempdir().unwrap();
+        let store = RecordingStore::new(dir.path().join("recordings"));
+        for n in 3..10 {
+            let mut input = fixture(n, &[]);
+            input.stopped_at_ms = 1_700_000_000_000;
+            store.save(&input).unwrap();
+        }
+        let mut input = fixture(10, &[]);
+        input.stopped_at_ms = 1_700_000_000_000;
+        let saved = store.save(&input).unwrap();
+        assert!(saved.path.exists());
+        let owned = store.owned_entries().unwrap();
+        assert_eq!(owned.len(), 7);
+        assert!(!owned.iter().any(|entry| entry.2.ends_with("-3")));
+        assert!(owned.iter().any(|entry| entry.2.ends_with("-10")));
+    }
+
+    #[test]
     fn ties_are_pruned_by_session_id() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("recordings");
         let store = RecordingStore::new(root.clone());
         for n in 0..8 {
             let mut recording = fixture(n, &[]);
-            recording.metadata.stopped_at_ms = 1_700_000_000_000;
+            recording.stopped_at_ms = 1_700_000_000_000;
             store.save(&recording).unwrap();
         }
         assert_eq!(entries(&root).len(), 7);
@@ -445,14 +531,21 @@ mod tests {
         }
         // An older valid entry reappears (for example after an interrupted prune).
         let old = fixture(0, &[0.125]);
-        let old_path = root.join(format!(
+        let old_path = root.join(format!("{:020}-{}", old.stopped_at_ms, old.session_id));
+        let existing = fixture(1, &[0.125]);
+        let existing_path = root.join(format!(
             "{:020}-{}",
-            old.metadata.stopped_at_ms, old.metadata.session_id
+            existing.stopped_at_ms, existing.session_id
         ));
+        let mut old_metadata: RecordingMetadata =
+            serde_json::from_slice(&fs::read(existing_path.join("metadata.json")).unwrap())
+                .unwrap();
+        old_metadata.session_id = old.session_id;
+        old_metadata.stopped_at_ms = old.stopped_at_ms;
         fs::create_dir(&old_path).unwrap();
         fs::write(
             old_path.join("metadata.json"),
-            serde_json::to_vec(&old.metadata).unwrap(),
+            serde_json::to_vec(&old_metadata).unwrap(),
         )
         .unwrap();
         fs::write(old_path.join("audio.wav"), b"wav").unwrap();
@@ -564,9 +657,9 @@ mod tests {
         assert!(outcome.path.join("audio.wav").is_file());
         assert!(
             outcome
-                .retention_warning
-                .unwrap()
-                .contains("directory sync")
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, SaveWarning::DirectorySyncFailed(_)))
         );
     }
 
@@ -586,10 +679,9 @@ mod tests {
         assert!(saved.path.join("audio.wav").is_file());
         assert!(
             saved
-                .retention_warning
-                .as_deref()
-                .unwrap()
-                .contains("directory sync")
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, SaveWarning::DirectorySyncFailed(_)))
         );
         assert_eq!(failing.owned_entries().unwrap().len(), 8);
         assert!(
@@ -633,34 +725,31 @@ mod tests {
         store.fail_prune = true;
         let outcome = store.save(&fixture(7, &[0.125])).unwrap();
         assert!(outcome.path.join("audio.wav").is_file());
-        assert!(outcome.retention_warning.unwrap().contains("retention"));
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, SaveWarning::PruneFailed(_)))
+        );
         assert_eq!(entries(&root).len(), 8);
         RecordingStore::new(root.clone()).reconcile().unwrap();
         assert_eq!(entries(&root).len(), 7);
     }
 
     #[test]
-    fn invalid_metadata_or_samples_cannot_publish_or_prune() {
+    fn invalid_input_cannot_publish_or_prune() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("recordings");
         let store = RecordingStore::new(root.clone());
         for n in 0..7 {
             store.save(&fixture(n, &[])).unwrap();
         }
-        for mut invalid in [
-            fixture(7, &[1.0]),
-            fixture(8, &[1.0]),
-            fixture(9, &[1.0]),
-            fixture(10, &[1.0]),
-        ] {
-            match invalid.metadata.stopped_at_ms % 10 {
-                7 => invalid.metadata.frames = 0,
-                8 => invalid.metadata.sample_rate = 0,
-                9 => invalid.metadata.version = 2,
-                _ => invalid.metadata.session_id = "../bad".into(),
-            }
-            assert!(store.save(&invalid).is_err());
-        }
+        let mut invalid_rate = fixture(7, &[1.0]);
+        invalid_rate.sample_rate = 0;
+        assert!(store.save(&invalid_rate).is_err());
+        let mut invalid_id = fixture(8, &[1.0]);
+        invalid_id.session_id = "../bad".into();
+        assert!(store.save(&invalid_id).is_err());
         assert_eq!(entries(&root).len(), 7);
     }
 
@@ -742,7 +831,7 @@ mod tests {
             store.save(&fixture(n, &[0.125])).unwrap();
         }
         let old = fixture(20, &[]);
-        let invalid = root.join(format!("{:020}-{}", 1, old.metadata.session_id));
+        let invalid = root.join(format!("{:020}-{}", 1, old.session_id));
         fs::create_dir(&invalid).unwrap();
         fs::write(invalid.join("metadata.json"), b"not json").unwrap();
         fs::write(invalid.join("audio.wav"), b"not wav").unwrap();

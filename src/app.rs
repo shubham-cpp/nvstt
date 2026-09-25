@@ -30,7 +30,7 @@ use crate::{
         create_recognizer, execution_provider,
     },
     recorder::{AudioSource, CaptureReport, CpalRecorder, NoopRecorder, Recorder},
-    recordings::{CaptureStatus, Recording, RecordingMetadata, RecordingStore},
+    recordings::{CaptureStatus, RecordingInput, RecordingSettings, RecordingStore, SaveWarning},
 };
 
 struct RecognitionWorker {
@@ -514,42 +514,51 @@ impl Daemon {
             Ok(DictationTranscript::Ready(_)) => TranscriptionStatus::Succeeded,
             Err(_) => TranscriptionStatus::Failed,
         };
-        let recording = Recording {
-            metadata: RecordingMetadata {
-                version: 1,
-                session_id: self
-                    .status
-                    .session_id
-                    .clone()
-                    .expect("listening session ID"),
-                stopped_at_ms: now_ms(),
-                sample_rate: worker.sample_rate,
-                frames: worker.audio.len(),
+        let recording = RecordingInput {
+            session_id: self
+                .status
+                .session_id
+                .clone()
+                .expect("listening session ID"),
+            stopped_at_ms: now_ms(), // Task 3 moves this read to immediately after stop.
+            sample_rate: worker.sample_rate,
+            settings: RecordingSettings {
                 model: self.config.model.clone(),
                 streaming_profile: self.config.streaming_profile.clone(),
                 speech_gate: self.config.speech_gate,
                 denoise: self.config.denoise,
                 itn: self.config.itn,
-                capture: CaptureStatus {
-                    dropped_samples: worker.capture.dropped_samples,
-                    backend_failed: worker.capture.backend_failed,
-                    duration_exceeded: worker.capture.duration_exceeded,
-                    stop_failed,
-                    drain_failed: worker.drain_failed,
-                },
-                transcription: status,
             },
+            capture: CaptureStatus {
+                dropped_samples: worker.capture.dropped_samples,
+                backend_failed: worker.capture.backend_failed,
+                duration_exceeded: worker.capture.duration_exceeded,
+                stop_failed,
+                drain_failed: worker.drain_failed,
+            },
+            transcription: status,
             samples: worker.audio,
         };
         let warning = match self.recordings.save(&recording) {
-            Ok(saved) => saved.retention_warning.map(|warning| {
-                warn!(path = %saved.path.display(), %warning, "recent audio saved with warning");
-                if warning.contains("retention prune failed") {
-                    format!("old audio could not be pruned; {warning}")
-                } else {
-                    warning
+            Ok(saved) => {
+                let warnings = saved
+                    .warnings
+                    .into_iter()
+                    .map(|warning| match warning {
+                        SaveWarning::DirectorySyncFailed(error) => {
+                            format!("recording saved, but directory sync failed: {error}")
+                        }
+                        SaveWarning::PruneFailed(error) => format!(
+                            "old audio could not be pruned; retention prune failed: {error}"
+                        ),
+                    })
+                    .collect::<Vec<_>>();
+                let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
+                if let Some(ref warning) = warning {
+                    warn!(path = %saved.path.display(), %warning, "recent audio saved with warning");
                 }
-            }),
+                warning
+            }
             Err(error) => {
                 warn!(error = %error, "audio was not saved");
                 Some("audio was not saved".to_owned())
@@ -1183,6 +1192,53 @@ mod tests {
         assert!(!metadata.capture.drain_failed);
         assert_eq!(wave.sample_rate, 16_000);
         assert_eq!(wave.samples, [0.25]);
+    }
+
+    #[test]
+    fn post_publication_warnings_preserve_delivery_and_no_speech() {
+        for no_speech in [false, true] {
+            for sync_failure in [true, false] {
+                let (mut daemon, effects, directory) = observed_daemon(CaptureFault::None);
+                if sync_failure {
+                    daemon.recordings.fail_root_sync_for_test();
+                } else {
+                    daemon.recordings.fail_prune_for_test();
+                }
+                if no_speech {
+                    daemon.recognizer = Some(Box::new(StaticRecognizer::no_speech()));
+                }
+                assert!(daemon.handle(IpcRequest::Toggle).is_ok());
+                let IpcResponse::Command { result } = daemon.handle(IpcRequest::Toggle) else {
+                    panic!("expected command");
+                };
+                assert!(result.ok);
+                assert_eq!(
+                    result.transcription,
+                    if no_speech {
+                        TranscriptionStatus::NoSpeech
+                    } else {
+                        TranscriptionStatus::Succeeded
+                    }
+                );
+                assert_eq!(
+                    result.delivery,
+                    if no_speech {
+                        DeliveryStatus::NotAttempted
+                    } else {
+                        DeliveryStatus::Delivered
+                    }
+                );
+                let effects = effects.lock().unwrap();
+                assert_eq!(effects.sent.len(), if no_speech { 0 } else { 1 });
+                assert_eq!(effects.records.len(), if no_speech { 0 } else { 1 });
+                assert_eq!(saved_recordings(&directory).len(), 1);
+                assert!(result.message.contains(if sync_failure {
+                    "directory sync failed"
+                } else {
+                    "old audio could not be pruned"
+                }));
+            }
+        }
     }
 
     #[test]
