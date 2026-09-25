@@ -1,6 +1,6 @@
 # Dictation reliability and archive ownership
 
-Status: proposed for user review.
+Status: approved by the user for implementation planning.
 
 ## Purpose
 
