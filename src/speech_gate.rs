@@ -380,6 +380,21 @@ mod tests {
     }
 
     #[test]
+    fn trailing_partial_boundary_is_emitted_once() {
+        let mut input = GateInput::new();
+        let mut state = GateState::default();
+        let frames = input.accept_16khz(&vec![0.5; VAD_FRAME_SAMPLES + 13]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(state.accept_frame(&frames[0], true), frame(0.5));
+        let tail = input.finish_session();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(&tail[0][..13], &[0.5; 13]);
+        assert!(tail[0][13..].iter().all(|sample| *sample == 0.0));
+        assert_eq!(state.accept_frame(&tail[0], false), tail[0]);
+        assert!(state.accept_frame(&frame(0.0), false).is_empty());
+    }
+
+    #[test]
     fn rejects_non_16khz_input() {
         let mut input = GateInput::new();
         let error = input

@@ -198,6 +198,31 @@ nvstt model evaluate --manifest /private/corpus/manifest.jsonl \
 The report includes each hypothesis, S/D/I counts, WER, silent-clip failures,
 and finalization latency. It never delivers text or changes configuration.
 
+For a paired gate comparison, put one private JSONL manifest with corrected
+references in the private state directory below. Use the same audio, Nemotron
+560 ms model, and profile for both runs. Change only `--speech-gate`. Run these
+commands only with your consent; keep the manifest, audio, and reports local.
+Do not commit or upload them.
+
+```bash
+umask 077
+NVSTT_PRIVATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/nvstt/private-evaluation"
+mkdir -p "$NVSTT_PRIVATE_DIR"
+chmod 700 "$NVSTT_PRIVATE_DIR"
+NVSTT_PRIVATE_MANIFEST="$NVSTT_PRIVATE_DIR/manifest.jsonl"
+test -f "$NVSTT_PRIVATE_MANIFEST" || { printf 'Add corrected references first.\n' >&2; exit 1; }
+nvstt model evaluate --manifest "$NVSTT_PRIVATE_MANIFEST" --model nemotron-speech-streaming-en-0.6b --streaming-profile 560ms --speech-gate true --json > "$NVSTT_PRIVATE_DIR/gate-on.json"
+nvstt model evaluate --manifest "$NVSTT_PRIVATE_MANIFEST" --model nemotron-speech-streaming-en-0.6b --streaming-profile 560ms --speech-gate false --json > "$NVSTT_PRIVATE_DIR/gate-off.json"
+```
+
+Compare each clip's reference and hypothesis, substitutions, deletions,
+insertions, and silent-clip failures across the two reports. Review corrected
+references to count first- and last-word errors yourself; the evaluator does
+not calculate these counts. Compare finalization times separately. Replay
+cannot measure live microphone callback timing, queue loss, or desktop text
+insertion. Paired accuracy evaluation is pending a consented, corrected private
+corpus. These instructions do not establish an accuracy improvement.
+
 ## Verify a Parakeet model with a WAV file
 
 The repository includes a small Parakeet verification example. It reads a
