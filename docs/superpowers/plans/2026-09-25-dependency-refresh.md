@@ -56,6 +56,7 @@ assert snapshot.is_dir() and snapshot.stat().st_mode & 0o777 == 0o700
 history = {row["id"]: row for row in json.loads((state / "history.json").read_text())}
 manifest = []
 checksums = {}
+rejected_dirs = 0
 
 def digest(path):
     h = hashlib.sha256()
@@ -64,16 +65,70 @@ def digest(path):
             h.update(block)
     return h.hexdigest()
 
+def unique_object(pairs):
+    fields = {}
+    for key, value in pairs:
+        if key in fields:
+            raise ValueError("duplicate metadata key")
+        fields[key] = value
+    return fields
+
+def reject_constant(value):
+    raise ValueError("non-JSON metadata constant")
+
+def owned_metadata(folder, meta):
+    if type(meta) is not dict:
+        return False
+    timestamp, sep, session_id = folder.name.partition("-")
+    session_time, id_sep, sequence = session_id.partition("-")
+    if not sep or len(timestamp) != 20 or not timestamp.isascii() or not timestamp.isdigit():
+        return False
+    if not id_sep or not all(part and part.isascii() and part.isdigit()
+                             for part in (session_time, sequence)):
+        return False
+    if any(type(meta.get(key)) is not str for key in ("session_id", "model", "streaming_profile", "transcription")):
+        return False
+    if any(type(meta.get(key)) is not int for key in ("version", "stopped_at_ms", "sample_rate", "frames")):
+        return False
+    if any(type(meta.get(key)) is not bool for key in ("speech_gate", "denoise", "itn")):
+        return False
+    capture = meta.get("capture")
+    if type(capture) is not dict or type(capture.get("dropped_samples")) is not int:
+        return False
+    if any(type(capture.get(key)) is not bool for key in
+           ("backend_failed", "duration_exceeded", "stop_failed", "drain_failed")):
+        return False
+    return (meta["version"] == 1 and 0 <= meta["stopped_at_ms"] < 2**64
+            and meta["stopped_at_ms"] == int(timestamp) and meta["session_id"] == session_id
+            and 0 <= meta["frames"] < 2**64 and -(2**31) <= meta["sample_rate"] < 2**31
+            and 0 <= capture["dropped_samples"] < 2**64
+            and meta["transcription"] in {"not_started", "no_speech", "succeeded", "failed"})
+
 for folder in root.iterdir():
-    if folder.is_symlink() or not folder.is_dir():
+    if folder.is_symlink():
+        rejected_dirs += 1
+        continue
+    if not folder.is_dir():
+        continue
+    if {entry.name for entry in folder.iterdir()} != {"metadata.json", "audio.wav"}:
+        rejected_dirs += 1
         continue
     sources = [folder / "metadata.json", folder / "audio.wav"]
     if not all(stat.S_ISREG(source.lstat().st_mode) for source in sources if source.exists()):
+        rejected_dirs += 1
         continue
     if not all(source.is_file() and not source.is_symlink() for source in sources):
+        rejected_dirs += 1
         continue
-    meta = json.loads(sources[0].read_text())
-    if meta.get("version") != 1 or folder.name != f"{meta['stopped_at_ms']:020d}-{meta['session_id']}":
+    try:
+        meta = json.loads(sources[0].read_text(), object_pairs_hook=unique_object,
+                          parse_constant=reject_constant)
+        json.dumps(meta, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (OSError, UnicodeError, ValueError):
+        rejected_dirs += 1
+        continue
+    if not owned_metadata(folder, meta):
+        rejected_dirs += 1
         continue
     dest = snapshot / folder.name
     dest.mkdir(mode=0o700)
@@ -90,10 +145,10 @@ for folder in root.iterdir():
 assert manifest, "no retained WAVs available"
 (snapshot / "manifest.jsonl").write_text("".join(json.dumps(row) + "\n" for row in manifest))
 (snapshot / "sha256.json").write_text(json.dumps(checksums, indent=2))
-print("private_snapshot_entries=", len(manifest), "path=", snapshot)
+print("private_snapshot_entries=", len(manifest), "rejected_dirs=", rejected_dirs, "path=", snapshot)
 ```
 
-- [ ] **Step 3: Check inventory.** Record the number of copied WAVs and their sample rates, model/profile, gate setting, and transcription/capture statuses. If a retained file used a different model or profile, do not silently evaluate it as Nemotron 560 ms; report it or group it under its installed original model. Treat every manifest reference as uncorrected history, not accuracy ground truth.
+- [ ] **Step 3: Check inventory.** Confirm the snapshot contains all seven currently retained store-owned WAVs. Report every rejected directory count; stop and investigate any missing expected WAV before replay. Record the copied WAV count, sample rates, model/profile, gate setting, and transcription/capture statuses. If a retained file used a different model or profile, do not silently evaluate it as Nemotron 560 ms; report it or group it under its installed original model. Treat every manifest reference as uncorrected history, not accuracy ground truth.
 - [ ] **Step 4: Replay both settings before updates.** In an owner-only shell (`umask 077`), run the current linked binary twice:
 
 ```bash
@@ -122,7 +177,7 @@ print("private_snapshot_entries=", len(manifest), "path=", snapshot)
 
 - [ ] **Step 1: Migrate download tests first.** In `src/installer.rs` tests, add a loopback `TcpListener` fixture that serves a small complete response and a Content-Length larger than the bytes sent. Assert `download_file` reports byte count/progress for the complete response and a truncated-download error for the short one. The fixture must never contact public endpoints.
 - [ ] **Step 2: Update manifest versions.** Replace the direct requirements for `bzip2` with `0.6.1` (retain `static`), `clap` with `4.6.7`, `cpal` with `0.18.2`, `thiserror` with `2.0.21`, `toml` with `1.1.6`, and `ureq` with `3.4.2`. Preserve existing feature choices unless the new package requires a documented equivalent.
-- [ ] **Step 3: Use current HTTP APIs.** In `download_file`, replace `ureq::AgentBuilder` with `ureq::Agent::config_builder()`. Use `.timeout_connect(Some(Duration::from_secs(30)))`, `.timeout_recv_body(Some(Duration::from_secs(30)))`, `.user_agent(concat!("nvstt/", env!("CARGO_PKG_VERSION")))`, `.build().new_agent()`. Read `content-length` from `response.headers().get("content-length").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok())`. Use `response.body_mut().as_reader()` for the streaming copy. Keep the existing `create_new`, length validation, progress, and sync order.
+- [ ] **Step 3: Use current HTTP APIs without a total download timeout.** In `download_file`, replace `ureq::AgentBuilder` with `ureq::Agent::config_builder()`. Set a 30-second connect and response-header timeout, and retain the existing user agent. Ureq 3's `timeout_recv_body` limits the whole file; instead, wrap its default transport connector to cap each network read at 30 seconds. Preserve TLS, proxy, redirect, and streaming behavior. Require final HTTP 200, not an unsolicited partial 206 response. Use `response.body().content_length()` for progress and length validation, and `response.body_mut().as_reader()` for the copy. Keep the existing `create_new`, progress, and sync order. Test a progressing transfer beyond one read timeout, stalled headers/body, and a partial response with short loopback timeouts.
 - [ ] **Step 4: Run focused tests.** Run `mise exec -- cargo test installer:: --quiet`, `mise exec -- cargo test config:: --quiet`, `mise exec -- cargo test recorder:: --quiet`, and `mise exec -- cargo test app:: --quiet`. Fix only migration breakage; add a failing test first if a new API changes behavior.
 - [ ] **Step 5: Refresh resolver-compatible transitive packages.** Run `mise exec -- cargo update`, then inspect `Cargo.lock` for direct-version mismatches and incompatible Rust versions. Recheck the official latest stable direct versions. If a current stable direct release cannot work without a policy change, stop and ask rather than claim full completion.
 
