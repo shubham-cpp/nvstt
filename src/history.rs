@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, io::Write, path::PathBuf};
 
 use crate::{
     domain::{DeliveryStatus, HistoryRecord},
@@ -47,9 +47,13 @@ impl JsonHistoryStore {
         fs::create_dir_all(parent)?;
 
         let payload = serde_json::to_vec_pretty(records)?;
-        let temporary = parent.join(format!(".history-{}.tmp", std::process::id()));
-        fs::write(&temporary, payload)?;
-        fs::rename(&temporary, &self.path)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(&payload)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(&self.path)
+            .map_err(|error| AppError::from(error.error))?;
+        fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
 }
@@ -141,5 +145,10 @@ mod tests {
         assert_eq!(record.transcript, "hello");
         assert_eq!(record.delivery_status, DeliveryStatus::CopiedToClipboard);
         assert_eq!(record.delivery_backend.as_deref(), Some("wl-copy"));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

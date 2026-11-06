@@ -8,7 +8,6 @@
 //! spoken forms, then apply user replacements.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeMap};
-use text_processing_rs::{NormalizeOptions, normalize_sentence_with_options};
 
 use crate::recognizer::RecognitionOutcome;
 
@@ -51,14 +50,26 @@ pub struct Replacements {
 }
 
 impl Replacements {
+    pub(crate) fn with_overrides(&self, overrides: &Self) -> Self {
+        let pairs = self
+            .rules
+            .iter()
+            .filter(|rule| {
+                !overrides
+                    .rules
+                    .iter()
+                    .any(|other| other.pattern == rule.pattern)
+            })
+            .chain(&overrides.rules)
+            .map(|rule| (rule.original_pattern.clone(), rule.replacement.clone()));
+        Self::from_pairs(pairs)
+    }
+
     pub fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
         let mut rules: Vec<ReplacementRule> = pairs
             .into_iter()
             .filter_map(|(pattern, replacement)| {
-                let tokens: Vec<String> = pattern
-                    .split_whitespace()
-                    .map(|token| word_core(token).to_ascii_lowercase())
-                    .collect();
+                let tokens = replacement_tokens(&pattern);
                 if tokens.is_empty() {
                     return None;
                 }
@@ -153,10 +164,7 @@ pub fn dictation_transcript(
         .collect();
     let content = without_fillers.join(" ");
     let normalized = if itn {
-        normalize_sentence_with_options(
-            &content,
-            NormalizeOptions::new().with_disable_bare_second(true),
-        )
+        crate::number_text::normalize_numbers(&content)
     } else {
         content
     };
@@ -276,6 +284,17 @@ fn token_parts(token: &str) -> TokenParts<'_> {
 
 fn word_core(token: &str) -> &str {
     token_parts(token).core
+}
+
+pub(crate) fn replacement_key(pattern: &str) -> String {
+    replacement_tokens(pattern).join(" ")
+}
+
+fn replacement_tokens(pattern: &str) -> Vec<String> {
+    pattern
+        .split_whitespace()
+        .map(|token| word_core(token).to_ascii_lowercase())
+        .collect()
 }
 
 #[cfg(test)]
@@ -442,19 +461,19 @@ mod tests {
     }
 
     #[test]
-    fn itn_dot_limitation_is_explicit() {
+    fn number_formatting_preserves_technical_words_for_replacements() {
         assert_eq!(
             clean("DOT"),
             Ok(DictationTranscript::Ready("DOT".to_owned()))
         );
         assert_eq!(
             dictation_transcript(transcript("DOT"), &Replacements::default(), true),
-            Ok(DictationTranscript::Ready(".".to_owned())),
+            Ok(DictationTranscript::Ready("DOT".to_owned())),
         );
         let raw_rule = Replacements::from_pairs([("DOT".to_owned(), "Graphviz".to_owned())]);
         assert_eq!(
             dictation_transcript(transcript("DOT"), &raw_rule, true),
-            Ok(DictationTranscript::Ready(".".to_owned())),
+            Ok(DictationTranscript::Ready("Graphviz".to_owned())),
         );
     }
 

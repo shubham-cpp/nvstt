@@ -5,6 +5,7 @@ use std::thread;
 pub enum NotificationEvent {
     Initialized,
     InitializationFailed(String),
+    StartFailed(String),
     ListeningStarted,
     Finalizing,
     NoSpeechDetected,
@@ -24,6 +25,7 @@ impl NotificationEvent {
                 "Ready",
                 "nvstt daemon initialized; server started".to_owned(),
             ),
+            Self::StartFailed(reason) => ("Could not start dictation", reason.clone()),
             Self::InitializationFailed(reason) => ("Initialization failed", reason.clone()),
             Self::ListeningStarted => ("Listening", "Dictation started".to_owned()),
             Self::Finalizing => ("Transcribing", "Finalizing dictation".to_owned()),
@@ -90,5 +92,75 @@ impl Notifier for NoopNotifier {
     fn notify(&mut self, event: NotificationEvent) -> Result<()> {
         self.events.push(event);
         Ok(())
+    }
+}
+
+/// Keep routine phase notifications when no tray host is reachable.
+pub struct TrayAwareNotifier<N> {
+    inner: N,
+    host: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<N: Notifier> TrayAwareNotifier<N> {
+    pub fn new(inner: N, host: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { inner, host }
+    }
+}
+
+impl<N: Notifier> Notifier for TrayAwareNotifier<N> {
+    fn notify(&mut self, event: NotificationEvent) -> Result<()> {
+        let routine = matches!(
+            event,
+            NotificationEvent::Initialized
+                | NotificationEvent::ListeningStarted
+                | NotificationEvent::Finalizing
+                | NotificationEvent::Transcribed
+                | NotificationEvent::Delivered(_)
+                | NotificationEvent::Canceled
+                | NotificationEvent::NoSpeechDetected
+        );
+        if !routine || !self.host.load(std::sync::atomic::Ordering::Acquire) {
+            self.inner.notify(event)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[test]
+    fn host_suppresses_phases_but_keeps_failures_and_clipboard_feedback() {
+        let host = Arc::new(AtomicBool::new(true));
+        let mut notifier = TrayAwareNotifier::new(NoopNotifier::default(), host.clone());
+        for event in [
+            NotificationEvent::ListeningStarted,
+            NotificationEvent::Finalizing,
+            NotificationEvent::Delivered("test".to_owned()),
+            NotificationEvent::Canceled,
+        ] {
+            notifier.notify(event).unwrap();
+        }
+        assert!(notifier.inner.events.is_empty());
+        for event in [
+            NotificationEvent::StartFailed("input".to_owned()),
+            NotificationEvent::InitializationFailed("model".to_owned()),
+            NotificationEvent::TranscriptionFailed("capture".to_owned()),
+            NotificationEvent::DeliveryFailed("delivery".to_owned()),
+            NotificationEvent::CopiedToClipboard,
+        ] {
+            notifier.notify(event).unwrap();
+        }
+        assert_eq!(notifier.inner.events.len(), 5);
+        host.store(false, Ordering::Release);
+        notifier
+            .notify(NotificationEvent::ListeningStarted)
+            .unwrap();
+        assert_eq!(notifier.inner.events.len(), 6);
     }
 }

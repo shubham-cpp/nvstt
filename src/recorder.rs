@@ -1,18 +1,32 @@
 use std::fmt::Display;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Sample, SampleFormat, Stream, StreamConfig};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::error::{AppError, Result};
+use crate::{
+    audio_input::resolve_device,
+    domain::InputPreference,
+    error::{AppError, Result},
+};
 
 const CAPTURE_QUEUE_SECONDS: usize = 5;
 const MAX_CAPTURE_SECONDS: usize = 30 * 60;
 const NOOP_SAMPLE_RATE: i32 = 16_000;
+const CAPTURE_PERIOD_MS: u32 = 20;
+const STOP_TAIL_MS: usize = 200;
+const CAPTURE_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const STOP_TAIL_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub trait Recorder: Send {
+    /// Called only between sessions. Implementations with no device may ignore it.
+    fn select_input(&mut self, _preference: InputPreference) -> Result<()> {
+        Ok(())
+    }
+
     fn start(&mut self) -> Result<()>;
     /// Stop capturing. The live source stays readable so the worker can drain.
     fn stop(&mut self) -> Result<CaptureReport>;
@@ -90,6 +104,7 @@ impl CaptureReport {
 
 #[derive(Debug, Default)]
 struct CaptureIntegrity {
+    received_samples: AtomicUsize,
     dropped_samples: AtomicUsize,
     duration_exceeded: AtomicBool,
     backend_failed: AtomicBool,
@@ -97,6 +112,20 @@ struct CaptureIntegrity {
 }
 
 impl CaptureIntegrity {
+    fn wait_for_samples(&self, target: usize, timeout: Duration) -> Result<()> {
+        let started = Instant::now();
+        while self.received_samples.load(Ordering::Acquire) < target {
+            self.result()?;
+            if started.elapsed() >= timeout {
+                return Err(AppError::Unavailable(
+                    "audio input stopped producing samples".into(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        self.result()
+    }
+
     fn report(&self) -> CaptureReport {
         CaptureReport {
             dropped_samples: self.dropped_samples.load(Ordering::SeqCst),
@@ -179,6 +208,9 @@ impl CaptureWriter {
                     .fetch_add(1, Ordering::SeqCst);
             }
         }
+        self.integrity
+            .received_samples
+            .store(self.total_samples, Ordering::Release);
     }
 }
 
@@ -267,9 +299,11 @@ impl AudioSource {
 /// blocking I/O. The daemon drains the capture after the stop toggle.
 #[derive(Default)]
 pub struct CpalRecorder {
+    preference: InputPreference,
     stream: Option<Stream>,
     source: Option<AudioSource>,
     integrity: Option<Arc<CaptureIntegrity>>,
+    sample_rate: usize,
 }
 
 impl CpalRecorder {
@@ -290,12 +324,27 @@ impl CpalRecorder {
             writer.accept_interleaved(data);
         };
         device
-            .build_input_stream(config, data_callback, error_callback, None)
+            .build_input_stream(
+                config,
+                data_callback,
+                error_callback,
+                Some(CAPTURE_READY_TIMEOUT),
+            )
             .map_err(|error| error.to_string())
     }
 }
 
 impl Recorder for CpalRecorder {
+    fn select_input(&mut self, preference: InputPreference) -> Result<()> {
+        if self.stream.is_some() {
+            return Err(AppError::InvalidState(
+                "cannot change an active input".to_owned(),
+            ));
+        }
+        self.preference = preference;
+        Ok(())
+    }
+
     fn start(&mut self) -> Result<()> {
         if self.stream.is_some() {
             return Err(AppError::InvalidState(
@@ -303,10 +352,8 @@ impl Recorder for CpalRecorder {
             ));
         }
 
-        let host = cpal::default_host();
-        let device = host.default_input_device().ok_or_else(|| {
-            AppError::Unavailable("no default audio input device is available".to_owned())
-        })?;
+        let started = Instant::now();
+        let device = resolve_device(&self.preference)?;
         let supported = device.default_input_config().map_err(|error| {
             AppError::Unavailable(format!(
                 "could not read the default input configuration: {error}"
@@ -328,7 +375,15 @@ impl Recorder for CpalRecorder {
         );
         let integrity = Arc::clone(&source.integrity);
         let sample_format = supported.sample_format();
-        let config: StreamConfig = supported.into();
+        let requested = (supported.sample_rate() * CAPTURE_PERIOD_MS / 1000).max(1);
+        let frames = match supported.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max } => requested.clamp(*min, *max),
+            cpal::SupportedBufferSize::Unknown => requested,
+        };
+        let mut config: StreamConfig = supported.into();
+        // PulseAudio's server default can buffer seconds before its first
+        // callback. Fixed periods also request a matching device latency.
+        config.buffer_size = cpal::BufferSize::Fixed(frames);
         let stream = match sample_format {
             SampleFormat::F32 => Self::build_stream::<f32>(&device, config, writer),
             SampleFormat::I8 => Self::build_stream::<i8>(&device, config, writer),
@@ -355,9 +410,17 @@ impl Recorder for CpalRecorder {
         stream.play().map_err(|error| {
             AppError::Unavailable(format!("could not start audio input stream: {error}"))
         })?;
+        integrity.wait_for_samples(1, CAPTURE_READY_TIMEOUT)?;
         self.stream = Some(stream);
         self.source = Some(source);
         self.integrity = Some(integrity);
+        self.sample_rate = sample_rate as usize;
+        tracing::info!(
+            startup_ms = started.elapsed().as_millis() as u64,
+            sample_rate,
+            callback_frames = frames,
+            "audio capture ready"
+        );
         Ok(())
     }
 
@@ -366,7 +429,22 @@ impl Recorder for CpalRecorder {
             .stream
             .take()
             .ok_or_else(|| AppError::InvalidState("recorder is not active".to_owned()))?;
+        let integrity = self.integrity.as_ref().expect("active capture integrity");
+        let stopped = Instant::now();
+        let target = integrity
+            .received_samples
+            .load(Ordering::Acquire)
+            .saturating_add(self.sample_rate * STOP_TAIL_MS / 1000);
+        // Let buffered device audio and the final spoken sound arrive before
+        // destroying the producer. The worker continues draining during this wait.
+        let tail = integrity.wait_for_samples(target, STOP_TAIL_TIMEOUT);
         drop(stream);
+        tail?;
+        tracing::info!(
+            stop_ms = stopped.elapsed().as_millis() as u64,
+            tail_ms = STOP_TAIL_MS,
+            "audio capture stopped"
+        );
         Ok(self
             .integrity
             .as_ref()
@@ -669,5 +747,123 @@ mod tests {
         let (mut writer, mut source) = capture_pair(16_000, 2, 2, 100);
         writer.accept_interleaved(&[1.0_f32, -1.0, 0.5, 0.5]);
         assert_eq!(source.drain().unwrap(), vec![0.0, 0.5]);
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn readiness_wait_requires_audio_and_preserves_it() {
+        let (mut writer, mut source) = capture_pair(16_000, 1, 16, 16);
+        assert!(
+            source
+                .integrity
+                .wait_for_samples(1, Duration::ZERO)
+                .is_err()
+        );
+        writer.accept_interleaved(&[0.25_f32, 0.5]);
+        source
+            .integrity
+            .wait_for_samples(2, Duration::ZERO)
+            .unwrap();
+        assert_eq!(source.drain().unwrap(), [0.25, 0.5]);
+        source
+            .integrity
+            .record_backend_error(&"device disconnected");
+        assert!(
+            source
+                .integrity
+                .wait_for_samples(2, Duration::ZERO)
+                .is_err()
+        );
+    }
+
+    fn recorder() -> CpalRecorder {
+        let id = std::env::var("NVSTT_TEST_INPUT").expect("use a private virtual source");
+        assert!(
+            id.contains("nvstt_boundary_test"),
+            "use the isolated test source"
+        );
+        let mut recorder = CpalRecorder::default();
+        recorder
+            .select_input(InputPreference::Device { id })
+            .unwrap();
+        recorder
+    }
+
+    #[test]
+    #[ignore = "requires NVSTT_TEST_INPUT pointing to an isolated virtual audio source"]
+    fn start_returns_only_after_audio_arrives() {
+        let mut recorder = recorder();
+        let started = Instant::now();
+        recorder.start().unwrap();
+        let startup = started.elapsed();
+        let mut source = recorder.audio_source().unwrap();
+        let first = source.drain().unwrap();
+        recorder.cancel().unwrap();
+        eprintln!(
+            "capture startup: {startup:?}, first callback: {} frames",
+            first.len()
+        );
+        assert!(
+            !first.is_empty(),
+            "Listening was acknowledged before the first audio callback"
+        );
+        assert!(
+            startup < Duration::from_millis(750),
+            "capture startup took {startup:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires NVSTT_TEST_INPUT pointing to an isolated virtual audio source"]
+    fn stop_retains_a_bounded_audio_tail() {
+        let mut recorder = recorder();
+        recorder.start().unwrap();
+        let mut source = recorder.audio_source().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while source.drain().unwrap().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "virtual source did not produce audio"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let stopped = Instant::now();
+        let report = recorder.stop().unwrap();
+        let tail = source.drain().unwrap();
+        eprintln!(
+            "capture stop: {:?}, tail: {} frames",
+            stopped.elapsed(),
+            tail.len()
+        );
+        assert!(!report.failed());
+        assert!(
+            tail.len() >= source.sample_rate() as usize / 5,
+            "stop discarded the pending capture tail: {} frames",
+            tail.len()
+        );
+        assert!(stopped.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    #[ignore = "requires NVSTT_TEST_INPUT pointing to an isolated virtual audio source"]
+    fn stalled_input_times_out_and_can_restart() {
+        let mut recorder = recorder();
+        recorder.start().unwrap();
+        let _source = recorder.audio_source().unwrap();
+        recorder.stream.as_ref().unwrap().pause().unwrap();
+        let stopped = Instant::now();
+        assert!(
+            recorder.stop().is_err(),
+            "stalled capture must not report success"
+        );
+        assert!(stopped.elapsed() < Duration::from_secs(2));
+        assert!(recorder.stream.is_none());
+        recorder.start().unwrap();
+        recorder.cancel().unwrap();
     }
 }

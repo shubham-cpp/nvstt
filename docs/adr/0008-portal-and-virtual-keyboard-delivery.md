@@ -2,6 +2,8 @@
 
 Status: accepted and implemented
 
+Transcript insertion now uses one paste shortcut. See [ADR 0016](0016-deliver-transcripts-as-paste.md).
+
 ## Decision
 
 Use one `TextSink` that selects native Wayland delivery at send time:

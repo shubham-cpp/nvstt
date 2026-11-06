@@ -250,6 +250,8 @@ struct NoiseSuppressor {
     state: Box<DenoiseState<'static>>,
     pending: Vec<f32>,
     first_frame: bool,
+    total_input: usize,
+    total_output: usize,
 }
 
 impl NoiseSuppressor {
@@ -258,10 +260,13 @@ impl NoiseSuppressor {
             state: DenoiseState::new(),
             pending: Vec::with_capacity(DenoiseState::FRAME_SIZE * 2),
             first_frame: true,
+            total_input: 0,
+            total_output: 0,
         }
     }
 
     fn accept(&mut self, samples: &[f32]) -> Vec<f32> {
+        self.total_input += samples.len();
         self.pending.extend_from_slice(samples);
         let mut output = Vec::new();
         while self.pending.len() >= DenoiseState::FRAME_SIZE {
@@ -276,16 +281,23 @@ impl NoiseSuppressor {
     }
 
     fn finish(&mut self) -> Vec<f32> {
-        if self.pending.is_empty() {
-            return Vec::new();
+        let mut output = Vec::with_capacity(DenoiseState::FRAME_SIZE * 2);
+        if !self.pending.is_empty() {
+            let mut frame = std::mem::take(&mut self.pending);
+            frame.resize(DenoiseState::FRAME_SIZE, 0.0);
+            for sample in &mut frame {
+                *sample = sample.clamp(-1.0, 1.0) * PCM_SCALE;
+            }
+            self.process_frame(&frame, &mut output);
         }
-        let mut frame = std::mem::take(&mut self.pending);
-        frame.resize(DenoiseState::FRAME_SIZE, 0.0);
-        for sample in &mut frame {
-            *sample = sample.clamp(-1.0, 1.0) * PCM_SCALE;
+        // RNNoise delays audio by one frame. Discarding its initial frame
+        // requires flushing that delayed frame even at an exact boundary.
+        while self.total_output < self.total_input {
+            self.process_frame(&[0.0; DenoiseState::FRAME_SIZE], &mut output);
         }
-        let mut output = Vec::with_capacity(DenoiseState::FRAME_SIZE);
-        self.process_frame(&frame, &mut output);
+        let excess = self.total_output.saturating_sub(self.total_input);
+        output.truncate(output.len().saturating_sub(excess));
+        self.total_output = self.total_input;
         output
     }
 
@@ -297,12 +309,27 @@ impl NoiseSuppressor {
             return;
         }
         output.extend(denoised.into_iter().map(|sample| sample / PCM_SCALE));
+        self.total_output += DenoiseState::FRAME_SIZE;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denoise_flush_preserves_partial_and_exact_frame_durations() {
+        for length in [0usize, 1, 479, 480, 481, 960, 1234, 4800] {
+            let mut pipeline = AudioPipeline::new(true);
+            let mut output = Vec::new();
+            for chunk in vec![0.25; length].chunks(317) {
+                output.extend(pipeline.accept_audio(48_000, chunk).unwrap());
+            }
+            output.extend(pipeline.finish().unwrap());
+            assert_eq!(output.len(), length.div_ceil(3), "input length {length}");
+            assert!(pipeline.finish().unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn sixteen_kilohertz_audio_passes_through_unchanged() {

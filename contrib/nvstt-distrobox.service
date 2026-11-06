@@ -1,0 +1,20 @@
+[Unit]
+Description=nvstt voice dictation in Fedora Distrobox
+After=graphical-session.target pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+# Copy the host launcher here. Install the binary in Fedora first.
+ExecStart=%h/.local/bin/nvstt-distrobox daemon
+Environment=NVSTT_DISTROBOX=Fedora
+Environment=NVSTT_BINARY=%h/.cargo/bin/nvstt
+Environment=RUST_LOG=nvstt=info
+KillMode=mixed
+TimeoutStopSec=45s
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+
+[Install]
+WantedBy=default.target

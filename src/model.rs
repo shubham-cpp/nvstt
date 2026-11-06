@@ -123,7 +123,7 @@ mod tests {
         let status = ModelStatus::inspect(&Config::default(), &paths(directory.path()));
         assert!(!status.ready);
         assert_eq!(status.missing_files().len(), 4);
-        assert!(!status.speech_gate.ready);
+        assert!(status.speech_gate.ready);
     }
 
     #[test]

@@ -116,8 +116,11 @@ pub fn read_wav(path: &Path) -> Result<Waveform> {
         .ok_or_else(|| AppError::Unavailable("WAV has no sample-rate metadata".to_owned()))?
         as i32;
     let data = data.ok_or_else(|| AppError::Unavailable("WAV has no data chunk".to_owned()))?;
-    if audio_format == Some(3) && data_truncated {
+    if data_truncated {
         return Err(AppError::Unavailable("WAV data is truncated".to_owned()));
+    }
+    if sample_rate <= 0 {
+        return Err(AppError::Unavailable("invalid WAV sample rate".into()));
     }
     let bytes_per_sample = (bits_per_sample / 8) as usize;
     if channels == 0 || data.len() % (channels * bytes_per_sample) != 0 {
@@ -146,7 +149,13 @@ pub fn read_wav(path: &Path) -> Result<Waveform> {
                 .sum::<f32>(),
             _ => unreachable!("validated WAV bit depth"),
         };
-        samples.push(sum / channels as f32);
+        let sample = sum / channels as f32;
+        if !sample.is_finite() {
+            return Err(AppError::Unavailable(
+                "WAV contains non-finite audio samples".into(),
+            ));
+        }
+        samples.push(sample);
     }
     Ok(Waveform {
         sample_rate,
@@ -279,6 +288,23 @@ mod tests {
             assert!(write_float_wav(&mut bytes, rate, &[]).is_err());
             assert!(bytes.is_empty());
         }
+    }
+
+    #[test]
+    fn reader_rejects_invalid_rate_and_nonfinite_samples() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("invalid.wav");
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut bytes = Vec::new();
+            write_float_wav(&mut bytes, 16_000, &[value]).unwrap();
+            fs::write(&path, bytes).unwrap();
+            assert!(read_wav(&path).is_err());
+        }
+        let mut bytes = Vec::new();
+        write_float_wav(&mut bytes, 16_000, &[0.0]).unwrap();
+        bytes[24..28].copy_from_slice(&0_u32.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+        assert!(read_wav(&path).is_err());
     }
 
     #[test]

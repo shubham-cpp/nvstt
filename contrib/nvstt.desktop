@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=nvstt
+Comment=Local Wayland voice dictation daemon
+TryExec=nvstt
+Exec=cardwire launch nvstt daemon
+Terminal=false
+X-GNOME-Autostart-enabled=true
+Type=Application
+Categories=Utility;AudioVideo;

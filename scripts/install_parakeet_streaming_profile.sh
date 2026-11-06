@@ -49,7 +49,7 @@ for attempt in {1..40}; do
 
     if [[ -f "$ARCHIVE" ]] && (( $(stat --format=%s "$ARCHIVE") == ARCHIVE_SIZE )); then
         printf 'restarting a corrupt %s download\n' "$ARTIFACT"
-        rm -f -- "$ARCHIVE"
+        gio trash -- "$ARCHIVE"
     fi
 
     printf 'downloading %s (attempt %s)\n' "$ARTIFACT" "$attempt"
@@ -71,7 +71,7 @@ for file in encoder.int8.onnx decoder.int8.onnx joiner.int8.onnx tokens.txt; do
 done
 
 mv "$STAGING/$ARTIFACT" "$TARGET"
-rmdir "$STAGING"
-rm -f -- "$ARCHIVE"
+gio trash "$STAGING"
+gio trash -- "$ARCHIVE"
 
 printf 'installed model: %s\n' "$TARGET"

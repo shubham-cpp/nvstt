@@ -93,8 +93,8 @@ official model artifact and can change accuracy and finalization latency.
 _Avoid_: Model speed, chunk size
 
 **Speech gate**:
-The local Silero VAD stage that forwards detected speech, pre-roll, and a
-short bridge to the streaming recognizer.
+The optional local Silero VAD stage that classifies the complete session.
+It forwards every audio sample without trimming quiet words or pauses.
 _Avoid_: Silence auto-finish, transcript filter
 
 **No-speech outcome**:
@@ -113,8 +113,8 @@ recognizer text is never inserted into the focused client.
 _Avoid_: Partial typing, live insertion
 
 **Dictation content**:
-The transcript after stutter collapse, filled-pause cleanup, replacements, and
-optional inverse text normalization. History and final delivery use this text.
+The transcript after stutter collapse, filled-pause cleanup, optional number formatting,
+and replacements. History and final delivery use this text.
 A dictation that contains only filled pauses uses the no-speech outcome.
 _Avoid_: Raw ASR text, cleaned result
 
@@ -129,6 +129,6 @@ collapse and filled-pause cleanup.
 _Avoid_: Vocabulary hint, dictionary correction
 
 **Inverse text normalization**:
-Conversion of spoken forms such as "twenty one" to written forms such as
-"21". It runs after replacements. It does not change a bare "second".
+Conversion of numeric spans such as "twenty one" to written forms such as
+"21". It runs before replacements. It preserves ranges and technical words.
 _Avoid_: Punctuation restoration, ASR correction

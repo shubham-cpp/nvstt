@@ -81,6 +81,21 @@ pub struct RecordingStore {
 }
 
 impl RecordingStore {
+    /// Select the newest complete retained recording, including failed ASR.
+    /// Returns its metadata and path without changing retention or history.
+    pub fn latest(&self) -> Result<(RecordingMetadata, PathBuf)> {
+        let entries = match self.owned_entries() {
+            Ok(entries) => entries,
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let (directory, _, _) = entries.last().ok_or_else(|| {
+            AppError::Unavailable("no complete recording is available to recover".into())
+        })?;
+        let metadata = serde_json::from_slice(&fs::read(directory.join("metadata.json"))?)?;
+        Ok((metadata, directory.join("audio.wav")))
+    }
+
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
@@ -415,6 +430,30 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().path())
             .collect()
+    }
+
+    #[test]
+    fn latest_selects_failed_asr_and_ignores_uncommitted_audio_without_mutation() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("recordings");
+        let store = RecordingStore::new(root.clone());
+        assert!(store.latest().is_err());
+        store.save(&fixture(9, &[0.125])).unwrap();
+        let mut failed = fixture(10, &[0.25]);
+        failed.stopped_at_ms = fixture(9, &[]).stopped_at_ms;
+        failed.transcription = TranscriptionStatus::Failed;
+        let saved = store.save(&failed).unwrap();
+        let staging = root.join(".staging-9999999999999-99");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("audio.wav"), b"unfinished").unwrap();
+        let before = fs::read(saved.path.join("metadata.json")).unwrap();
+        let (metadata, audio) = store.latest().unwrap();
+        assert_eq!(metadata.session_id, failed.session_id);
+        assert_eq!(metadata.transcription, TranscriptionStatus::Failed);
+        assert_eq!(audio, saved.path.join("audio.wav"));
+        assert_eq!(fs::read(saved.path.join("metadata.json")).unwrap(), before);
+        assert_eq!(fs::read(staging.join("audio.wav")).unwrap(), b"unfinished");
+        assert_eq!(entries(&root).len(), 3);
     }
 
     #[test]

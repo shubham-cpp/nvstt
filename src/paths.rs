@@ -49,6 +49,10 @@ pub fn default_paths() -> Result<AppPaths> {
 }
 
 impl AppPaths {
+    pub fn vocabulary_path(&self) -> PathBuf {
+        self.config_path.with_file_name("vocabulary.json")
+    }
+
     pub fn create_user_dirs(&self) -> Result<()> {
         if let Some(config_dir) = self.config_path.parent() {
             create_private_dir(config_dir)?;

@@ -1,11 +1,11 @@
 use std::process::{Command, Stdio};
 use std::{
     env, fs,
-    io::{self, Write},
+    io::{Seek, Write},
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -22,42 +22,114 @@ pub struct ClipboardSink;
 
 impl TextSink for ClipboardSink {
     fn send_final_text(&mut self, text: &str) -> Result<DeliveryOutcome> {
-        let mut child = Command::new("wl-copy")
-            .stdin(Stdio::piped())
-            .spawn()
-            .map_err(|error| AppError::Unavailable(format!("wl-copy is unavailable: {error}")))?;
-
-        let write_result = child
-            .stdin
-            .take()
-            .ok_or_else(|| AppError::Unavailable("wl-copy stdin is unavailable".to_owned()))
-            .and_then(|mut stdin| stdin.write_all(text.as_bytes()).map_err(AppError::from));
-
-        if let Err(error) = write_result {
-            let _ = child.kill();
-            return Err(error);
-        }
-
-        let status = child
-            .wait()
-            .map_err(|error| AppError::Unavailable(format!("wl-copy failed: {error}")))?;
-        if !status.success() {
-            return Err(AppError::Unavailable(format!(
-                "wl-copy exited with status {status}"
-            )));
-        }
-
+        copy_selection(text, false)?;
         Ok(DeliveryOutcome::CopiedToClipboard {
             backend: "wl-copy".to_owned(),
         })
     }
 }
 
+fn copy_selection(text: &str, primary: bool) -> Result<()> {
+    let mut command = Command::new("wl-copy");
+    command.args(["--type", "text/plain;charset=utf-8"]);
+    if primary {
+        command.arg("--primary");
+    }
+    run_clipboard_command(&mut command, text, Duration::from_secs(3))
+}
+
+fn prepare_paste(text: &str) -> Result<()> {
+    // Shift+Insert uses PRIMARY in Kitty/GTK and CLIPBOARD in other clients.
+    // Set both before sending any key. Keep the clipboard available for recovery.
+    copy_selection(text, false)?;
+    copy_selection(text, true)
+}
+
+trait PasteKeyboard {
+    fn hold_shift(&mut self) -> Result<()>;
+    fn tap_insert(&mut self) -> Result<()>;
+    fn release_shift(&mut self) -> Result<()>;
+}
+
+fn paste_shortcut(keyboard: &mut impl PasteKeyboard) -> Result<()> {
+    let result = keyboard.hold_shift().and_then(|()| keyboard.tap_insert());
+    // Even a failed send can have reached the compositor. Attempt cleanup on
+    // every path; NativeFirstSink then drops failed connections without replay.
+    let release = keyboard.release_shift();
+    result.and(release)
+}
+
+impl PasteKeyboard for eitype::EiType {
+    fn hold_shift(&mut self) -> Result<()> {
+        self.hold_modifier("shift")
+            .map_err(|error| AppError::Unavailable(format!("EI paste modifier: {error}")))
+    }
+
+    fn tap_insert(&mut self) -> Result<()> {
+        self.press_key("insert")
+            .map_err(|error| AppError::Unavailable(format!("EI paste key: {error}")))
+    }
+
+    fn release_shift(&mut self) -> Result<()> {
+        self.release_modifiers()
+            .map_err(|error| AppError::Unavailable(format!("EI modifier release: {error}")))
+    }
+}
+
+impl PasteKeyboard for wrtype::WrtypeClient {
+    fn hold_shift(&mut self) -> Result<()> {
+        self.press_modifier(wrtype::Modifier::Shift)
+            .map_err(|error| AppError::Unavailable(format!("Wayland paste modifier: {error}")))
+    }
+
+    fn tap_insert(&mut self) -> Result<()> {
+        self.type_key("Insert")
+            .map_err(|error| AppError::Unavailable(format!("Wayland paste key: {error}")))
+    }
+
+    fn release_shift(&mut self) -> Result<()> {
+        self.release_modifier(wrtype::Modifier::Shift)
+            .map_err(|error| AppError::Unavailable(format!("Wayland modifier release: {error}")))
+    }
+}
+
+fn run_clipboard_command(command: &mut Command, text: &str, timeout: Duration) -> Result<()> {
+    // Anonymous input avoids blocking on a pipe if the clipboard tool stalls
+    // before reading. No transcript appears in argv or a named temporary file.
+    let mut input = tempfile::tempfile()?;
+    input.write_all(text.as_bytes())?;
+    input.rewind()?;
+    let mut child = command
+        .stdin(Stdio::from(input))
+        .spawn()
+        .map_err(|e| AppError::Unavailable(format!("clipboard tool is unavailable: {e}")))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(AppError::Unavailable(format!(
+                    "clipboard tool exited with {status}"
+                )));
+            }
+            Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(10)),
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AppError::Unavailable(match result {
+                    Err(error) => format!("clipboard tool failed: {error}"),
+                    _ => "clipboard tool timed out".to_owned(),
+                }));
+            }
+        }
+    }
+}
+
 /// Native Wayland virtual-keyboard delivery.
 ///
-/// `wrtype` performs the protocol negotiation at construction time.  It binds
-/// `zwp_virtual_keyboard_manager_v1`, selects the first `wl_seat`, and uploads
-/// transient XKB keymaps for the final UTF-8 text.  A compositor can still
+/// `wrtype` performs the protocol negotiation at construction time. It binds
+/// `zwp_virtual_keyboard_manager_v1`, selects the first `wl_seat`, and sends
+/// the paste shortcut. A compositor can still
 /// reject the client after the global is advertised, so callers must retain a
 /// fallback sink and treat send errors as capability failures.
 pub struct WaylandVirtualKeyboardSink {
@@ -188,12 +260,11 @@ impl TextSink for PortalEiSink {
             ));
         }
 
-        self.client.type_text(text).map_err(|error| {
-            AppError::Unavailable(format!("EI portal rejected the transcript: {error}"))
-        })?;
+        prepare_paste(text)?;
+        paste_shortcut(&mut self.client)?;
 
         Ok(DeliveryOutcome::Delivered {
-            backend: "xdg-remote-desktop/libei".to_owned(),
+            backend: "xdg-remote-desktop/libei-paste".to_owned(),
         })
     }
 }
@@ -206,14 +277,11 @@ impl TextSink for WaylandVirtualKeyboardSink {
             ));
         }
 
-        self.client.type_text(text).map_err(|error| {
-            AppError::Unavailable(format!(
-                "Wayland virtual keyboard rejected the transcript: {error}"
-            ))
-        })?;
+        prepare_paste(text)?;
+        paste_shortcut(&mut self.client)?;
 
         Ok(DeliveryOutcome::Delivered {
-            backend: "zwp_virtual_keyboard_v1".to_owned(),
+            backend: "zwp_virtual_keyboard_v1-paste".to_owned(),
         })
     }
 }
@@ -228,12 +296,12 @@ impl TextSink for WaylandVirtualKeyboardSink {
 /// subsequent transcripts. If a compositor drops either connection, the sink
 /// discards it and preserves the failure reason in clipboard metadata.
 pub struct NativeFirstSink {
-    portal: Option<PortalEiSink>,
+    portal: Option<Box<dyn TextSink>>,
     portal_attempted: bool,
-    virtual_keyboard: Option<WaylandVirtualKeyboardSink>,
+    virtual_keyboard: Option<Box<dyn TextSink>>,
     virtual_keyboard_attempted: bool,
     native_error: Option<String>,
-    clipboard: ClipboardSink,
+    clipboard: Box<dyn TextSink>,
     restore_token_path: Option<PathBuf>,
 }
 
@@ -245,7 +313,7 @@ impl NativeFirstSink {
             virtual_keyboard: None,
             virtual_keyboard_attempted: false,
             native_error: None,
-            clipboard: ClipboardSink,
+            clipboard: Box::new(ClipboardSink),
             restore_token_path: None,
         }
     }
@@ -262,7 +330,7 @@ impl NativeFirstSink {
         }
         self.portal_attempted = true;
         match PortalEiSink::connect(self.restore_token_path.as_deref()) {
-            Ok(portal) => self.portal = Some(portal),
+            Ok(portal) => self.portal = Some(Box::new(portal)),
             Err(error) => self.native_error = Some(error.to_string()),
         }
     }
@@ -273,7 +341,7 @@ impl NativeFirstSink {
         }
         self.virtual_keyboard_attempted = true;
         match WaylandVirtualKeyboardSink::connect() {
-            Ok(keyboard) => self.virtual_keyboard = Some(keyboard),
+            Ok(keyboard) => self.virtual_keyboard = Some(Box::new(keyboard)),
             Err(error) => {
                 self.native_error = Some(match self.native_error.take() {
                     Some(previous) => format!("{previous}; {error}"),
@@ -304,7 +372,11 @@ impl TextSink for NativeFirstSink {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => {
                     self.portal = None;
+                    self.portal_attempted = false;
                     self.native_error = Some(error.to_string());
+                    // The failed send may have inserted a prefix. Never
+                    // replay it through another automatic backend.
+                    return self.copy_fallback(text);
                 }
             }
         }
@@ -315,17 +387,25 @@ impl TextSink for NativeFirstSink {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => {
                     self.virtual_keyboard = None;
+                    self.virtual_keyboard_attempted = false;
                     self.native_error = Some(match self.native_error.take() {
                         Some(previous) => format!("{previous}; {error}"),
                         None => error.to_string(),
                     });
+                    return self.copy_fallback(text);
                 }
             }
         }
 
+        self.copy_fallback(text)
+    }
+}
+
+impl NativeFirstSink {
+    fn copy_fallback(&mut self, text: &str) -> Result<DeliveryOutcome> {
         match self.clipboard.send_final_text(text) {
             Ok(DeliveryOutcome::CopiedToClipboard { backend }) => {
-                let backend = match self.native_error.take() {
+                let backend = match self.native_error.as_ref() {
                     Some(reason) => format!("{backend}; automatic delivery failed: {reason}"),
                     None => backend,
                 };
@@ -335,7 +415,7 @@ impl TextSink for NativeFirstSink {
             Err(error) => {
                 let reason = self
                     .native_error
-                    .take()
+                    .as_ref()
                     .map(|native| format!("automatic delivery failed: {native}; "))
                     .unwrap_or_default();
                 Err(AppError::Unavailable(format!(
@@ -364,26 +444,13 @@ fn write_restore_token(path: &Path, token: &str) -> Result<()> {
     })?;
     fs::create_dir_all(parent)?;
 
-    let temporary = path.with_extension("tmp");
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temporary)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(token.as_bytes())?;
     file.write_all(b"\n")?;
-    file.sync_all()?;
-    set_user_only_permissions(&temporary)?;
-    fs::rename(temporary, path)?;
-    Ok(())
-}
-
-fn set_user_only_permissions(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
+    file.as_file().sync_all()?;
+    file.persist(path)
+        .map_err(|error| AppError::from(error.error))?;
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -415,6 +482,87 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn paste_shortcut_releases_shift_on_every_failure_without_repeating_insert() {
+        struct Keyboard {
+            fail: Option<&'static str>,
+            events: Vec<&'static str>,
+        }
+        impl Keyboard {
+            fn event(&mut self, name: &'static str) -> Result<()> {
+                self.events.push(name);
+                if self.fail == Some(name) {
+                    Err(AppError::Unavailable(name.into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl PasteKeyboard for Keyboard {
+            fn hold_shift(&mut self) -> Result<()> {
+                self.event("hold")
+            }
+            fn tap_insert(&mut self) -> Result<()> {
+                self.event("insert")
+            }
+            fn release_shift(&mut self) -> Result<()> {
+                self.event("release")
+            }
+        }
+        for failure in [None, Some("hold"), Some("insert"), Some("release")] {
+            let mut keyboard = Keyboard {
+                fail: failure,
+                events: Vec::new(),
+            };
+            assert_eq!(paste_shortcut(&mut keyboard).is_ok(), failure.is_none());
+            let expected = if failure == Some("hold") {
+                vec!["hold", "release"]
+            } else {
+                vec!["hold", "insert", "release"]
+            };
+            assert_eq!(keyboard.events, expected);
+        }
+    }
+
+    #[test]
+    fn partial_native_failure_copies_once_without_retyping() {
+        struct PartialFailure;
+        impl TextSink for PartialFailure {
+            fn send_final_text(&mut self, _: &str) -> Result<DeliveryOutcome> {
+                Err(AppError::Unavailable("failed after a prefix".into()))
+            }
+        }
+        struct MustNotType;
+        impl TextSink for MustNotType {
+            fn send_final_text(&mut self, _: &str) -> Result<DeliveryOutcome> {
+                panic!("must not type a second copy after a partial failure")
+            }
+        }
+        let mut sink = NativeFirstSink::new();
+        sink.portal_attempted = true;
+        sink.portal = Some(Box::new(PartialFailure));
+        sink.virtual_keyboard = Some(Box::new(MustNotType));
+        sink.clipboard = Box::new(StaticSink::new(DeliveryOutcome::CopiedToClipboard {
+            backend: "test".into(),
+        }));
+        let outcome = sink.send_final_text("complete transcript").unwrap();
+        assert!(matches!(outcome, DeliveryOutcome::CopiedToClipboard { .. }));
+        assert!(!sink.portal_attempted, "reconnect on a later attempt");
+    }
+
+    #[test]
+    fn clipboard_stall_has_a_deadline_even_with_large_input() {
+        let started = Instant::now();
+        let error = run_clipboard_command(
+            Command::new("sleep").arg("10"),
+            &"x".repeat(1_000_000),
+            Duration::from_millis(40),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn restore_token_round_trip_is_user_only() {

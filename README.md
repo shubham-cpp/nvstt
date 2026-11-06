@@ -1,5 +1,13 @@
 # nvstt
 
+This project is archived.
+
+Use [Hex](https://github.com/anomalyco/hex/releases/) for local voice dictation on Linux, macOS, and Windows.
+
+Hex holds a shortcut, transcribes on the device, and pastes into the current app.
+
+The text below describes nvstt at the time of archive.
+
 Local Linux voice dictation for Wayland desktops.
 
 ## Current status
@@ -11,11 +19,11 @@ The repository contains a working native first release slice:
 - Explicit dictation state machine.
 - Persisted ten-record JSON history.
 - Separate transcription and delivery results.
-- Passive notification boundary.
+- Generic Linux system tray with five activity icons and notification fallback.
 - Final-only delivery contract.
-- CPAL default-input capture with mono downmix and sample-rate conversion.
+- Runtime microphone selection, mono downmix, and sample-rate conversion.
 - Live bounded audio handoff to the recognizer while listening.
-- Native Nemotron streaming 0.6B INT8 recognizer through sherpa-onnx.
+- Native Parakeet and Nemotron INT8 recognizers through sherpa-onnx.
 - Local Silero VAD gate with final-only delivery and no-speech results.
 - Native-first text delivery through the XDG RemoteDesktop portal/libei path.
 - Runtime-probed `zwp_virtual_keyboard_v1` fallback for wlroots/Smithay WMs.
@@ -37,17 +45,122 @@ The current daemon uses a development recognizer only when
 installed before listening can start. `nvstt status` reports model readiness;
 `nvstt model status` checks the files without contacting the daemon.
 
+## System tray and microphones
+
+The daemon publishes one StatusNotifierItem and a D-Bus menu through ksni.
+It uses no KDE library. Plasma, Waybar, and Quickshell can host this protocol.
+GNOME needs a tray extension.
+
+The icon shows ready, listening, transcribing, typing, or error.
+Starting uses the ready shape with a `Starting` label.
+Typing covers the delivery operation, including portal authorization.
+The last result remains visible after the daemon returns to idle.
+Clipboard fallback reports `Copied`, so you know to paste the text.
+
+Click the item to open its menu. Panel behavior can differ.
+The microphone submenu includes system default, physical inputs, and virtual inputs.
+Playback monitors have a separate label.
+Use `Refresh inputs` after connecting or removing a device.
+Input changes apply between dictations. Selection resets when the daemon restarts.
+A missing selected device fails explicitly. nvstt never substitutes another input.
+
+```bash
+nvstt audio inputs --json
+nvstt audio select --id 'pulseaudio:SOURCE_NAME'
+nvstt audio select --system-default
+nvstt clear-error
+nvstt daemon --no-tray
+```
+
+Copy the input ID from `audio inputs`. Display names are not selection IDs.
+System default resolves again at each recording start.
+Selection changes nvstt only. It does not change the system microphone default.
+
+Cancel recording is available while listening.
+Use your existing toggle shortcut to stop and deliver text.
+The menu has no delivery action because opening it can change keyboard focus.
+
+Status remains available during transcription and delivery.
+Other requests can return `busy` during an accepted operation.
+Retry those requests after completion. nvstt does not defer microphone changes.
+A changed menu invalidates old item IDs, including cancellation from an earlier recording.
+
+With a reachable tray host, nvstt suppresses routine phase notifications.
+Failures and clipboard feedback still produce notifications.
+Without a host, or with `--no-tray`, normal phase notifications remain.
+A panel can hide an item despite reporting a host. Use `--no-tray` if you need notifications.
+Tooltips and menu labels exclude transcripts, portal tokens, and raw backend errors.
+
+Waybar needs `"tray"` in its configured module list.
+Quickshell needs a `SystemTray` host and menu handling through `QsMenuAnchor`.
+Its icon-only examples can require additional menu wiring.
+No panel configuration changes are part of nvstt installation.
+
+Live verification covered Plasma registration, ready/listening rendering, and microphone selection.
+Three actual sources opened and canceled, including Easy Effects.
+D-Bus tests cover stale actions, absent hosts, late hosts, and watcher restart.
+Waybar and Quickshell live rendering remain untested in this workspace.
+Physical unplug, suspend/resume, and whole session-bus replacement also remain untested.
+
+## Running from Fedora Distrobox
+
+Build through the existing Fedora container:
+
+```bash
+rtk proxy distrobox enter --name Fedora -- mise exec -- cargo build --locked --release
+```
+
+An init-enabled container can have its own session bus.
+Its tray must connect to the desktop host's session bus.
+Keep `XDG_RUNTIME_DIR` unchanged when fixing this connection.
+
+Run the host launcher with a container binary path:
+
+```bash
+NVSTT_BINARY="$PWD/target/release/nvstt" scripts/run_in_distrobox.sh daemon
+```
+
+The launcher maps the host Unix bus socket through Distrobox's `/run/host` mount.
+It fails if that mapping is absent. It does not silently use the container bus.
+It forwards shutdown to its own container process and waits for exit.
+If that process ignores shutdown for 30 seconds, the launcher stops it forcibly.
+It verifies the launch token before each signal.
+`NVSTT_DISTROBOX` defaults to `Fedora`. Set it for a different container.
+The normal shared home and audio/display integration must remain available.
+
+For a host-managed service, install the launcher as `~/.local/bin/nvstt-distrobox`.
+Use [the Distrobox unit](contrib/nvstt-distrobox.service) instead of the native unit.
+Install the binary inside Fedora at the path set by `NVSTT_BINARY`.
+Start the service within a graphical user session.
+Run only one daemon for the normal socket.
+Stop an existing service or autostart process before changing launch arrangements.
+
+The launcher requires host Bash, Distrobox, and `gio` for temporary-file cleanup.
+ksni and the PulseAudio protocol client need no GTK, Qt, or native libpulse headers.
+The existing ALSA, Wayland, XKB, and C++ build requirements still apply.
+Capture now prefers CPAL's PulseAudio backend when its server is available.
+It uses the PipeWire PulseAudio compatibility socket on typical PipeWire systems.
+
+`--no-tray` changes presentation only. It does not restore the old audio backend.
+Keep your previous binary and launch command before deploying a replacement.
+Verification used separate binaries, sockets, and state directories.
+It did not replace or restart the active daemon.
+The tray changes passed CPU validation. CUDA validation remains pending.
+For the later reliability repairs and installed configuration, see the
+[dictation reliability audit](docs/research/18-dictation-reliability-audit.md).
+
 ## Configuration
 
-If the file does not exist, nvstt selects Nemotron streaming with its local
-speech gate. Create `$XDG_CONFIG_HOME/nvstt/config.toml` (normally
+If the file does not exist, nvstt selects Parakeet Unified with its 1120 ms profile. The optional
+speech detector preserves the full waveform. Create `$XDG_CONFIG_HOME/nvstt/config.toml` (normally
 `~/.config/nvstt/config.toml`) with:
 
 ```toml
 [model]
-name = "nemotron-speech-streaming-en-0.6b"
-streaming_profile = "560ms"
-speech_gate = true
+name = "parakeet-unified-en-0.6b"
+streaming_profile = "1120ms"
+speech_gate = false
+num_threads = 4
 
 [audio]
 denoise = false
@@ -68,6 +181,10 @@ Capture uses a bounded queue. If the queue loses audio or the input backend
 reports a stream error, nvstt rejects that session. It does not type or save
 a partial transcript. Start another session after correcting the input issue.
 
+Start speaking when the app shows Listening. Capture requests 20 ms buffers and confirms the first audio callback.
+Normal stop keeps 200 ms of trailing audio before closing the microphone. Cancellation closes it without this tail.
+See the [capture-boundary tests](docs/research/19-toggle-capture-boundaries.md) for measured startup times and diagnostics.
+
 The five-second queue capacity is provisional. It does not guarantee a
 five-second recording limit or any particular insertion latency. The separate
 30-minute session limit stays unchanged.
@@ -75,8 +192,8 @@ five-second recording limit or any particular insertion latency. The separate
 Cleanup removes clear lowercase or title-case `uh` and `um` variants.
 Ambiguous words, uppercase acronyms, and technical symbols remain.
 
-Inverse text normalization is on by default. It converts spoken numbers,
-dates, money, and measurements to written forms. Set `text.itn = false` to
+Inverse text normalization is on by default. It converts spoken numeric spans
+to written numbers. It preserves ranges and technical words. Set `text.itn = false` to
 keep the spoken forms. The phrase `give me a second` keeps the word `second`.
 
 Inverse text normalization runs before `[text.replacements]`. Patterns see
@@ -88,19 +205,20 @@ even when the configured pattern includes them. Single-token punctuation
 mappings remain allowed. For example, `"nv , stt" = "nvstt"` does not match
 `nv , stt`, but `"," = "comma"` can replace a standalone comma.
 
-ITN can still change literal technical words. For example, `DOT` becomes `.`.
-Set `text.itn = false` when literal technical wording matters more than
-spoken-number and punctuation conversion. This repair does not change your
-configuration automatically.
+`five to eight` becomes `5 to 8`, and `DOT` remains `DOT`.
+Times and dates are not inferred from ambiguous wording.
+Set `text.itn = false` to disable numeric conversion.
+Incorrect setting types and duplicate flat/section settings are errors.
 
 See [ADR 0013](docs/adr/0013-dictation-integrity.md) for compatibility changes
-and validation limits. The public CLI, IPC, and configuration schemas stay
-unchanged, as does the history format.
+and validation limits. The tray adds CLI and IPC commands and status fields.
+Existing commands, configuration, and the history format remain compatible.
 
 The closed registry supports Nemotron profiles 80 ms, 160 ms, 560 ms, and
 1120 ms. It also supports Parakeet Unified profiles 240 ms, 560 ms, and
-1120 ms for rollback. Existing Parakeet configuration does not enable VAD
-unless it sets `speech_gate = true`.
+1120 ms. Parakeet TDT v3 uses the `offline` profile and a 120-second limit.
+Set `speech_gate = true` to classify silent sessions without removing audio.
+The default leaves this optional detector off.
 
 ## Model files
 
@@ -108,11 +226,11 @@ The selected model directory contains its encoder, decoder, joiner, token
 files, and, when enabled, `silero_vad.onnx`. A new default install selects:
 
 ```text
-$XDG_DATA_HOME/nvstt/models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25/
+$XDG_DATA_HOME/nvstt/models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-1120ms/
 ```
 
 The directory must contain `encoder.int8.onnx`, `decoder.int8.onnx`,
-`joiner.int8.onnx`, `tokens.txt`, and `silero_vad.onnx`. If `XDG_DATA_HOME`
+`joiner.int8.onnx`, and `tokens.txt`. Speech detection also needs `silero_vad.onnx`. If `XDG_DATA_HOME`
 is not set, use `~/.local/share/nvstt/models/`.
 
 Install the model explicitly with:
@@ -271,9 +389,12 @@ connect to the user daemon over a private Unix socket.
 
 ## Development run
 
-On Linux, install the CPAL and Wayland/XKB build headers first. Fedora uses
-`alsa-lib-devel`, `wayland-devel`, and `libxkbcommon-devel`; Debian and Ubuntu
-use `libasound2-dev`, `libwayland-dev`, and `libxkbcommon-dev`.
+On Linux, install the CPAL and Wayland/XKB build headers first. The default
+CPU build also links the C++ runtime for the static sherpa-onnx libraries.
+Fedora uses `gcc-c++`, `pkg-config`, `alsa-lib-devel`, `wayland-devel`, and
+`libxkbcommon-devel`. Debian and Ubuntu use `g++`, `pkg-config`,
+`libasound2-dev`, `libwayland-dev`, and `libxkbcommon-dev`. On Fedora 43 the
+`libstdc++.so` linker file comes from `gcc-c++`, not from `libstdc++-devel`.
 
 ```bash
 cargo test
@@ -303,6 +424,11 @@ nvstt toggle                 # start, then stop and deliver
 nvstt cancel                 # cancel an active session
 nvstt status [--json]        # daemon and model readiness
 nvstt history [--json]      # last ten successful transcripts
+nvstt audio inputs --json   # refresh microphone IDs and source kinds
+nvstt audio select --id ID  # select input for the next recording
+nvstt audio select --system-default
+nvstt clear-error
+nvstt daemon --no-tray      # keep notification-only presentation
 nvstt model install         # explicitly download the selected model and VAD
 nvstt model status [--json] # local model file check
 nvstt model path             # expected model directory
@@ -311,3 +437,58 @@ nvstt model evaluate --manifest PATH --json # private-corpus report
 
 See [IMPLEMENTATION_SPEC.md](./IMPLEMENTATION_SPEC.md) for the accepted
 architecture and milestone plan.
+
+## Reliability and recovery
+
+Final transcripts are pasted as one operation through the authorized native keyboard.
+nvstt sets CLIPBOARD and PRIMARY, then sends Shift+Insert.
+This avoids long streams of simulated keystrokes and supports Unicode outside the keyboard layout.
+Both clipboard selections contain the latest transcript afterward.
+The focused field must support Shift+Insert. If automatic delivery fails, paste from the clipboard or use history.
+
+See [reliability checks](docs/reliability.md) for private corpus snapshots,
+repeatable model comparisons, release limits, and native regressions.
+The reports separate raw recognition from final text. Unknown references remain unscored.
+
+Recover saved audio without typing into the desktop:
+
+```sh
+nvstt recover
+nvstt recover --json
+nvstt transcribe /private/audio.wav --json
+```
+
+`recover` selects the newest complete saved recording, including failed transcription attempts.
+It uses your current model and corrections. It leaves history and saved audio unchanged.
+It cannot restore speech absent from the audio.
+
+### Personal corrections
+
+Teach recurring spelling corrections without restarting the daemon:
+
+```sh
+nvstt vocabulary add "para keet" "Parakeet"
+nvstt vocabulary add "nv stt" "nvstt"
+nvstt vocabulary test "Use para keet with twenty one files in nv stt."
+nvstt vocabulary list
+nvstt vocabulary remove "para keet"
+```
+
+The preview prints `Use Parakeet with 21 files in nvstt.`
+Corrections apply after number formatting. They match whole phrases and ignore ASCII letter case.
+Longer phrases win. Personal rules override matching rules in `config.toml`.
+Replacement text does not trigger another correction.
+Use the preview to check a rule before dictating.
+
+Edits apply at the start of the next dictation. Active recordings keep their original rules.
+Rules live in `$XDG_CONFIG_HOME/nvstt/vocabulary.json`, normally `~/.config/nvstt/vocabulary.json`.
+Writes are private and atomic. Concurrent edits fail clearly instead of overwriting another edit.
+Invalid files stop a new dictation with an error.
+These are text corrections; they do not retrain the speech model.
+
+History writes use private atomic files. Clipboard tools have a deadline.
+After a partial native typing failure, nvstt copies the complete text instead of typing a second copy.
+A failed native connection can reconnect on the next dictation.
+
+See [ADR 0015](docs/adr/0015-preserve-complete-audio-and-measure-recognition.md)
+for the audio-preservation and conservative-number decisions.

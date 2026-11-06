@@ -37,6 +37,142 @@ pub struct StatusSnapshot {
     pub model_path: Option<String>,
     pub message: String,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default)]
+    pub audio: AudioStatus,
+    #[serde(default)]
+    pub feedback: Feedback,
+}
+
+impl StatusSnapshot {
+    pub fn starting(config: &crate::config::Config) -> Self {
+        Self {
+            state: DaemonState::Starting,
+            model: config.model.clone(),
+            streaming_profile: config.streaming_profile.clone(),
+            speech_gate_enabled: config.speech_gate,
+            execution_provider: crate::recognizer::execution_provider().to_owned(),
+            model_ready: false,
+            model_path: None,
+            message: "starting".to_owned(),
+            session_id: None,
+            revision: 0,
+            generation: 0,
+            audio: AudioStatus::default(),
+            feedback: Feedback::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum InputPreference {
+    #[default]
+    SystemDefault,
+    Device {
+        id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputKind {
+    Source,
+    Monitor,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AudioInput {
+    pub id: String,
+    pub name: String,
+    pub kind: InputKind,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AudioStatus {
+    pub selected: InputPreference,
+    pub active: Option<AudioInput>,
+    pub default_input: Option<AudioInput>,
+    pub inputs: Vec<AudioInput>,
+    pub available: bool,
+    pub stale: bool,
+}
+
+impl AudioStatus {
+    pub fn selected_input(&self) -> Option<&AudioInput> {
+        match &self.selected {
+            InputPreference::SystemDefault => self.default_input.as_ref(),
+            InputPreference::Device { id } => self.inputs.iter().find(|input| &input.id == id),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        if let Some(active) = &self.active {
+            return active.name.clone();
+        }
+        let unavailable = if self.stale || !self.available {
+            " (unavailable; refresh inputs)"
+        } else {
+            ""
+        };
+        match &self.selected {
+            InputPreference::SystemDefault => self.default_input.as_ref().map_or_else(
+                || "System default unavailable".to_owned(),
+                |input| format!("System default: {}{unavailable}", input.name),
+            ),
+            InputPreference::Device { .. } => self.selected_input().map_or_else(
+                || "Selected input unavailable".to_owned(),
+                |input| format!("{}{unavailable}", input.name),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureStage {
+    Start,
+    Transcription,
+    Delivery,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum AttemptOutcome {
+    Delivered,
+    Copied,
+    NoSpeech,
+    Canceled,
+    Failed { stage: FailureStage, reason: String },
+}
+
+impl AttemptOutcome {
+    /// Deliberately excludes raw backend errors, which can contain private text.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Delivered => "Delivered",
+            Self::Copied => "Copied; automatic delivery unavailable",
+            Self::NoSpeech => "No speech",
+            Self::Canceled => "Canceled",
+            Self::Failed { stage, .. } => match stage {
+                FailureStage::Start => "Could not start dictation; check nvstt status",
+                FailureStage::Transcription => "Transcription failed; check nvstt status",
+                FailureStage::Delivery => "Delivery failed; check nvstt status",
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Feedback {
+    pub outcome: Option<AttemptOutcome>,
+    pub initialization_failed: bool,
+    pub command_error: Option<String>,
+    pub warning: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -137,6 +273,18 @@ impl HistoryRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_status_payload_keeps_new_fields_optional() {
+        let status: StatusSnapshot = serde_json::from_str(
+            r#"{"state":"idle","model":"legacy","message":"ready","session_id":null}"#,
+        )
+        .unwrap();
+        assert_eq!(status.state, DaemonState::Idle);
+        assert_eq!(status.audio.selected, InputPreference::SystemDefault);
+        assert_eq!(status.generation, 0);
+        assert!(status.feedback.outcome.is_none());
+    }
 
     #[test]
     fn history_record_has_json_safe_timestamp() {

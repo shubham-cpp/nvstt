@@ -4,7 +4,7 @@ use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig, OnlineStream};
 
 use crate::{
     audio_pipeline::MODEL_SAMPLE_RATE,
-    config::{Config, RecognizerFamily},
+    config::{Config, NEMOTRON_STREAMING_MODEL, PARAKEET_UNIFIED_MODEL, RecognizerFamily},
     error::{AppError, Result},
     speech_gate::{SpeechGate, VAD_SAMPLE_RATE},
 };
@@ -106,8 +106,6 @@ impl StreamingRecognizer for StaticRecognizer {
     }
 }
 
-const DEFAULT_NUM_THREADS: i32 = 8;
-
 #[cfg(all(feature = "cpu-runtime", feature = "cuda-runtime"))]
 compile_error!("select either cpu-runtime or cuda-runtime, not both");
 
@@ -132,10 +130,20 @@ pub fn execution_provider() -> &'static str {
 pub struct OnlineTransducerRecognizer {
     recognizer: OnlineRecognizer,
     stream: Option<OnlineStream>,
+    leading_padding_samples: usize,
+    tail_padding_samples: usize,
 }
 
 impl OnlineTransducerRecognizer {
     pub fn from_model_dir(model_dir: impl Into<PathBuf>, model_name: &str) -> Result<Self> {
+        Self::with_threads(model_dir, model_name, crate::config::default_num_threads())
+    }
+
+    fn with_threads(
+        model_dir: impl Into<PathBuf>,
+        model_name: &str,
+        num_threads: i32,
+    ) -> Result<Self> {
         let model_dir = model_dir.into();
         let encoder = required_model_file(
             &model_dir,
@@ -157,9 +165,10 @@ impl OnlineTransducerRecognizer {
         config.model_config.transducer.joiner = Some(joiner.to_string_lossy().into_owned());
         config.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
         config.model_config.provider = Some(EXECUTION_PROVIDER.to_owned());
-        config.model_config.num_threads = DEFAULT_NUM_THREADS;
+        config.model_config.num_threads = num_threads;
         config.model_config.debug = std::env::var_os("NVSTT_RECOGNIZER_DEBUG").is_some();
-        config.enable_endpoint = true;
+        // The stop command owns the session boundary. Endpoint rules are unused.
+        config.enable_endpoint = false;
         config.decoding_method = Some("greedy_search".to_owned());
 
         let recognizer = OnlineRecognizer::create(&config).ok_or_else(|| {
@@ -172,6 +181,23 @@ impl OnlineTransducerRecognizer {
         Ok(Self {
             recognizer,
             stream: None,
+            // Unified can omit a short utterance in its initial window.
+            // Two largest-profile center chunks of silence features
+            // recovered the short-utterance regression. Keep this context
+            // inside ASR so capture, VAD, and saved audio stay unmodified.
+            leading_padding_samples: if model_name == PARAKEET_UNIFIED_MODEL {
+                MODEL_SAMPLE_RATE as usize * 2240 / 1000
+            } else {
+                0
+            },
+            // NeMo's IsReady requires a complete window even at EOF. Cover
+            // the largest supported 1120 ms profile plus feature context.
+            // Parakeet Unified pads its own final feature window at EOF.
+            tail_padding_samples: if model_name == NEMOTRON_STREAMING_MODEL {
+                MODEL_SAMPLE_RATE as usize * 1280 / 1000
+            } else {
+                0
+            },
         })
     }
 
@@ -195,7 +221,11 @@ impl StreamingRecognizer for OnlineTransducerRecognizer {
                 "recognizer session is already active".to_owned(),
             ));
         }
-        self.stream = Some(self.recognizer.create_stream());
+        let stream = self.recognizer.create_stream();
+        if self.leading_padding_samples != 0 {
+            stream.accept_waveform(MODEL_SAMPLE_RATE, &vec![0.0; self.leading_padding_samples]);
+        }
+        self.stream = Some(stream);
         Ok(())
     }
 
@@ -215,22 +245,32 @@ impl StreamingRecognizer for OnlineTransducerRecognizer {
     }
 
     fn finish_session(&mut self) -> Result<RecognitionOutcome> {
-        let Some(stream) = self.stream.as_ref() else {
+        let Some(stream) = self.stream.take() else {
             return Err(AppError::InvalidState(
                 "recognizer session is not active".to_owned(),
             ));
         };
+        // Padding belongs after VAD and before EOF. It is never microphone
+        // audio and must not enter the recent-recording store.
+        if self.tail_padding_samples != 0 {
+            stream.accept_waveform(MODEL_SAMPLE_RATE, &vec![0.0; self.tail_padding_samples]);
+        }
         stream.input_finished();
-        while self.recognizer.is_ready(stream) {
-            self.recognizer.decode(stream);
+        while self.recognizer.is_ready(&stream) {
+            self.recognizer.decode(&stream);
         }
         let transcript = self
             .recognizer
-            .get_result(stream)
+            .get_result(&stream)
             .map(|result| result.text)
-            .unwrap_or_default();
-        self.stream = None;
-        Ok(RecognitionOutcome::Transcript(transcript))
+            .ok_or_else(|| {
+                AppError::Unavailable("recognizer returned an invalid result".to_owned())
+            })?;
+        if transcript.trim().is_empty() {
+            Ok(RecognitionOutcome::NoSpeech)
+        } else {
+            Ok(RecognitionOutcome::Transcript(transcript))
+        }
     }
 
     fn cancel_session(&mut self) -> Result<()> {
@@ -318,9 +358,20 @@ pub fn create_recognizer(
     config.validate()?;
     let model_dir = model_dir.into();
     let recognizer: Box<dyn StreamingRecognizer> = match config.recognizer_family() {
-        Some(RecognizerFamily::OnlineTransducer) => Box::new(
-            OnlineTransducerRecognizer::from_model_dir(&model_dir, &config.model)?,
-        ),
+        Some(RecognizerFamily::OnlineTransducer) => {
+            Box::new(OnlineTransducerRecognizer::with_threads(
+                &model_dir,
+                &config.model,
+                config.num_threads,
+            )?)
+        }
+        Some(RecognizerFamily::OfflineTransducer) => {
+            Box::new(crate::offline_recognizer::ParakeetTdtRecognizer::new(
+                &model_dir,
+                &config.model,
+                config.num_threads,
+            )?)
+        }
         None => {
             return Err(AppError::Config(format!(
                 "unsupported recognizer family for '{}'",
@@ -339,7 +390,11 @@ pub fn create_recognizer(
     }
 }
 
-fn required_model_file(model_dir: &Path, model_name: &str, names: &[&str]) -> Result<PathBuf> {
+pub(crate) fn required_model_file(
+    model_dir: &Path,
+    model_name: &str,
+    names: &[&str],
+) -> Result<PathBuf> {
     names
         .iter()
         .map(|name| model_dir.join(name))

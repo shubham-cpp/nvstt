@@ -1,9 +1,9 @@
-//! A local, bounded speech gate for online recognition.
+//! Session-level speech detection.
 //!
-//! The detector sees 16 kHz audio in 512-sample frames. The recognizer sees
-//! only detected speech, with enough preceding audio to retain word starts.
+//! VAD classifies a session but never removes audio inside it. Quiet speech
+//! and long pauses must reach the recognizer unchanged.
 
-use std::{collections::VecDeque, path::Path};
+use std::path::Path;
 
 use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 
@@ -14,73 +14,12 @@ use crate::{
 
 pub const VAD_SAMPLE_RATE: i32 = MODEL_SAMPLE_RATE;
 const VAD_FRAME_SAMPLES: usize = 512;
-const PRE_ROLL_SAMPLES: usize = 6_400;
-const SILENCE_BRIDGE_SAMPLES: usize = 3_200;
 const MAX_SEGMENT_SECONDS: f32 = 30.0;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GateFlush {
     pub samples: Vec<f32>,
     pub speech_detected: bool,
-}
-
-/// The pure audio-routing state. Keeping it separate makes boundary behavior
-/// testable without loading the native VAD model.
-#[derive(Debug, Default)]
-struct GateState {
-    pre_roll: VecDeque<f32>,
-    active: bool,
-    saw_speech: bool,
-}
-
-impl GateState {
-    fn accept_frame(&mut self, frame: &[f32], detected: bool) -> Vec<f32> {
-        self.push_pre_roll(frame);
-
-        let output = match (self.active, detected) {
-            (false, false) => Vec::new(),
-            (false, true) => {
-                let mut output = Vec::with_capacity(
-                    self.pre_roll.len()
-                        + if self.saw_speech {
-                            SILENCE_BRIDGE_SAMPLES
-                        } else {
-                            0
-                        },
-                );
-                if self.saw_speech {
-                    output.resize(SILENCE_BRIDGE_SAMPLES, 0.0);
-                }
-                output.extend(self.pre_roll.iter().copied());
-                self.active = true;
-                self.saw_speech = true;
-                output
-            }
-            (true, true) => frame.to_vec(),
-            (true, false) => {
-                // The VAD turns off only after its configured silence. Keep
-                // this boundary frame so a final word is not clipped.
-                self.active = false;
-                frame.to_vec()
-            }
-        };
-        if !output.is_empty() {
-            self.pre_roll.clear();
-        }
-        output
-    }
-
-    fn push_pre_roll(&mut self, samples: &[f32]) {
-        self.pre_roll.extend(samples.iter().copied());
-        let excess = self.pre_roll.len().saturating_sub(PRE_ROLL_SAMPLES);
-        self.pre_roll.drain(..excess);
-    }
-
-    fn reset(&mut self) {
-        self.pre_roll.clear();
-        self.active = false;
-        self.saw_speech = false;
-    }
 }
 
 /// Exact VAD framing. This is separate from the detector so edge cases do not
@@ -121,19 +60,23 @@ impl GateInput {
 
     fn accept_16khz(&mut self, samples: &[f32]) -> Vec<Vec<f32>> {
         self.pending.extend_from_slice(samples);
-        let mut frames = Vec::new();
-        while self.pending.len() >= VAD_FRAME_SAMPLES {
-            frames.push(self.pending.drain(..VAD_FRAME_SAMPLES).collect());
-        }
+        let complete = self.pending.len() / VAD_FRAME_SAMPLES * VAD_FRAME_SAMPLES;
+        let frames = self.pending[..complete]
+            .as_chunks::<VAD_FRAME_SAMPLES>()
+            .0
+            .iter()
+            .map(|frame| frame.to_vec())
+            .collect();
+        self.pending.drain(..complete);
         frames
     }
 }
 
-/// Silero VAD that gates 16 kHz input chunks before a recognizer.
+/// Silero VAD that classifies a session without cutting the ASR waveform.
 pub struct SpeechGate {
     detector: VoiceActivityDetector,
     input: GateInput,
-    state: GateState,
+    saw_speech: bool,
 }
 
 impl SpeechGate {
@@ -174,7 +117,7 @@ impl SpeechGate {
         Ok(Self {
             detector,
             input: GateInput::new(),
-            state: GateState::default(),
+            saw_speech: false,
         })
     }
 
@@ -184,37 +127,26 @@ impl SpeechGate {
 
     pub fn accept_audio(&mut self, sample_rate: i32, samples: &[f32]) -> Result<Vec<f32>> {
         let frames = self.input.accept_audio(sample_rate, samples)?;
-        Ok(frames
-            .iter()
-            .flat_map(|frame| self.accept_frame(frame))
-            .collect())
+        for frame in frames {
+            self.accept_frame(&frame);
+        }
+        // Preserve original samples, including a partial detector frame.
+        Ok(samples.to_vec())
     }
 
     pub fn finish_session(&mut self) -> GateFlush {
-        let mut output = self
-            .input
-            .finish_session()
-            .iter()
-            .flat_map(|frame| self.accept_frame(frame))
-            .collect::<Vec<_>>();
-
-        self.detector.flush();
-        if !self.state.saw_speech {
-            while let Some(samples) = self
-                .detector
-                .front()
-                .map(|segment| segment.samples().to_vec())
-            {
-                output.extend(samples);
-                self.state.saw_speech = true;
-                self.detector.pop();
-            }
+        for frame in self.input.finish_session() {
+            self.accept_frame(&frame);
         }
+        self.detector.flush();
+        self.saw_speech |= !self.detector.is_empty();
         self.clear_segments();
-        let speech_detected = self.state.saw_speech;
+        let speech_detected = self.saw_speech;
         self.reset_session();
         GateFlush {
-            samples: output,
+            // All original samples were already forwarded. Detector padding
+            // and queued segments must never be replayed into ASR.
+            samples: Vec::new(),
             speech_detected,
         }
     }
@@ -223,11 +155,10 @@ impl SpeechGate {
         self.reset_session();
     }
 
-    fn accept_frame(&mut self, frame: &[f32]) -> Vec<f32> {
+    fn accept_frame(&mut self, frame: &[f32]) {
         self.detector.accept_waveform(frame);
-        let output = self.state.accept_frame(frame, self.detector.detected());
+        self.saw_speech |= self.detector.detected() || !self.detector.is_empty();
         self.clear_segments();
-        output
     }
 
     fn clear_segments(&self) {
@@ -239,125 +170,13 @@ impl SpeechGate {
     fn reset_session(&mut self) {
         self.detector.reset();
         self.input.reset();
-        self.state.reset();
+        self.saw_speech = false;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn frame(value: f32) -> Vec<f32> {
-        vec![value; VAD_FRAME_SAMPLES]
-    }
-
-    #[test]
-    fn accepts_speech_at_the_first_frame() {
-        let mut state = GateState::default();
-        let first = frame(1.0);
-        assert_eq!(state.accept_frame(&first, true), first);
-        assert!(state.saw_speech);
-    }
-
-    #[test]
-    fn keeps_pre_roll_before_detected_speech() {
-        let mut state = GateState::default();
-        let silence = frame(0.0);
-        let speech = frame(1.0);
-        state.accept_frame(&silence, false);
-        let output = state.accept_frame(&speech, true);
-        assert_eq!(&output[..VAD_FRAME_SAMPLES], &silence);
-        assert_eq!(&output[VAD_FRAME_SAMPLES..], &speech);
-    }
-
-    #[test]
-    fn no_speech_does_not_emit_samples() {
-        let mut state = GateState::default();
-        for _ in 0..20 {
-            assert!(state.accept_frame(&frame(0.0), false).is_empty());
-        }
-        assert!(!state.saw_speech);
-    }
-
-    #[test]
-    fn long_pauses_keep_pre_roll_bounded() {
-        let mut state = GateState::default();
-        for _ in 0..20 {
-            state.accept_frame(&frame(0.0), false);
-        }
-        let output = state.accept_frame(&frame(1.0), true);
-        assert_eq!(output.len(), PRE_ROLL_SAMPLES);
-    }
-
-    #[test]
-    fn keeps_the_last_boundary_frame_after_speech() {
-        let mut state = GateState::default();
-        let speech = frame(1.0);
-        let last = frame(0.25);
-        state.accept_frame(&speech, true);
-        assert_eq!(state.accept_frame(&last, false), last);
-        assert!(!state.active);
-    }
-
-    #[test]
-    fn adds_a_short_silence_bridge_between_regions() {
-        let mut state = GateState::default();
-        let speech = frame(1.0);
-        let silence = frame(0.0);
-        state.accept_frame(&speech, true);
-        state.accept_frame(&silence, false);
-        let output = state.accept_frame(&speech, true);
-        let expected = [vec![0.0; SILENCE_BRIDGE_SAMPLES], speech].concat();
-        assert_eq!(output, expected);
-    }
-
-    #[test]
-    fn restart_never_replays_emitted_frames() {
-        let mut state = GateState::default();
-        let first = frame(1.0);
-        let boundary = frame(2.0);
-        let second = frame(3.0);
-        assert_eq!(state.accept_frame(&first, true), first);
-        assert_eq!(state.accept_frame(&boundary, false), boundary);
-        let output = state.accept_frame(&second, true);
-        let expected = [vec![0.0; SILENCE_BRIDGE_SAMPLES], second].concat();
-        assert_eq!(output, expected);
-    }
-
-    #[test]
-    fn repeated_transitions_preserve_only_unemitted_preroll() {
-        let mut state = GateState::default();
-        let mut nonzero = Vec::new();
-        for (value, detected) in [
-            (1.0, true),
-            (2.0, false),
-            (3.0, false),
-            (4.0, true),
-            (5.0, false),
-            (6.0, true),
-        ] {
-            nonzero.extend(
-                state
-                    .accept_frame(&frame(value), detected)
-                    .into_iter()
-                    .filter(|sample| *sample != 0.0),
-            );
-        }
-        let expected = (1..=6)
-            .flat_map(|value| frame(value as f32))
-            .collect::<Vec<_>>();
-        assert_eq!(nonzero, expected);
-    }
-
-    #[test]
-    fn reset_clears_a_repeated_session() {
-        let mut state = GateState::default();
-        state.accept_frame(&frame(1.0), true);
-        state.reset();
-        assert!(!state.active);
-        assert!(!state.saw_speech);
-        assert!(state.pre_roll.is_empty());
-    }
 
     #[test]
     fn accepts_arbitrary_chunk_sizes_and_keeps_the_last_sample() {
@@ -378,21 +197,6 @@ mod tests {
         let output = frames.into_iter().flatten().collect::<Vec<_>>();
         assert_eq!(&output[..input_samples.len()], &input_samples);
         assert_eq!(output[input_samples.len()], 0.0);
-    }
-
-    #[test]
-    fn trailing_partial_boundary_is_emitted_once() {
-        let mut input = GateInput::new();
-        let mut state = GateState::default();
-        let frames = input.accept_16khz(&vec![0.5; VAD_FRAME_SAMPLES + 13]);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(state.accept_frame(&frames[0], true), frame(0.5));
-        let tail = input.finish_session();
-        assert_eq!(tail.len(), 1);
-        assert_eq!(&tail[0][..13], &[0.5; 13]);
-        assert!(tail[0][13..].iter().all(|sample| *sample == 0.0));
-        assert_eq!(state.accept_frame(&tail[0], false), tail[0]);
-        assert!(state.accept_frame(&frame(0.0), false).is_empty());
     }
 
     #[test]

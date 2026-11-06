@@ -1,5 +1,6 @@
 pub mod app;
 pub mod audio;
+pub mod audio_input;
 pub mod audio_pipeline;
 pub mod config;
 pub mod delivery;
@@ -12,8 +13,15 @@ pub mod installer;
 pub mod ipc;
 pub mod model;
 pub mod notifier;
+mod number_text;
+mod offline_recognizer;
 pub mod paths;
 pub mod recognizer;
 pub mod recorder;
 pub mod recordings;
 pub mod speech_gate;
+pub mod vocabulary;
+
+mod controller;
+mod tray;
+mod tray_icons;

@@ -53,7 +53,7 @@ download_with_resume() {
 
         if [[ -f "$archive" ]] && (( $(stat --format=%s "$archive") == expected_size )); then
             printf 'restarting a corrupt %s download\n' "$name"
-            rm -f -- "$archive"
+            gio trash -- "$archive"
         fi
 
         printf 'downloading %s (attempt %s)\n' "$name" "$attempt"
@@ -131,7 +131,7 @@ for library in \
 done
 
 mv "$STAGING_DIR" "$DESTINATION"
-rm -f -- \
+gio trash -- \
     "$CACHE_ROOT/cuda-cudart.tar.xz" \
     "$CACHE_ROOT/cublas.tar.xz" \
     "$CACHE_ROOT/cufft.tar.xz" \

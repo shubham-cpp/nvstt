@@ -1,11 +1,14 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::{
-    domain::{DeliveryStatus, HistoryRecord, StatusSnapshot, TranscriptionStatus},
+    domain::{
+        AudioStatus, DeliveryStatus, HistoryRecord, InputPreference, StatusSnapshot,
+        TranscriptionStatus,
+    },
     error::{AppError, Result},
 };
 
@@ -16,6 +19,9 @@ pub enum IpcRequest {
     Cancel,
     Status,
     History { limit: usize },
+    AudioInputs,
+    SelectInput { preference: InputPreference },
+    ClearError,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -34,6 +40,7 @@ pub enum IpcResponse {
     Command { result: CommandResult },
     Status { snapshot: StatusSnapshot },
     History { records: Vec<HistoryRecord> },
+    AudioInputs { audio: AudioStatus },
     Error { code: String, message: String },
 }
 
@@ -41,7 +48,7 @@ impl IpcResponse {
     pub fn is_ok(&self) -> bool {
         match self {
             Self::Command { result } => result.ok,
-            Self::Status { .. } | Self::History { .. } => true,
+            Self::Status { .. } | Self::History { .. } | Self::AudioInputs { .. } => true,
             Self::Error { .. } => false,
         }
     }
@@ -72,11 +79,14 @@ pub async fn send_request(socket_path: &Path, request: &IpcRequest) -> Result<Ip
 }
 
 pub async fn read_request(reader: tokio::net::unix::OwnedReadHalf) -> Result<IpcRequest> {
-    let mut reader = BufReader::new(reader);
+    const MAX_REQUEST_BYTES: u64 = 16 * 1024;
+    let mut reader = BufReader::new(reader.take(MAX_REQUEST_BYTES + 1));
     let mut line = String::new();
     let bytes = reader.read_line(&mut line).await?;
-    if bytes == 0 {
-        return Err(AppError::Ipc("client closed the connection".to_owned()));
+    if bytes == 0 || bytes as u64 > MAX_REQUEST_BYTES || !line.ends_with('\n') {
+        return Err(AppError::Ipc(
+            "request is empty, too large, or incomplete".to_owned(),
+        ));
     }
     serde_json::from_str(line.trim()).map_err(AppError::from)
 }
